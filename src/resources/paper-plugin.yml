@@ -1,7 +1,12 @@
-name: PaperPlugin
+name: SneakyPocketbase
 version: "1.0"
-main: com.danidipp.paperplugin.PaperPlugin
+main: com.danidipp.sneakypocketbase.SneakyPocketbase
 api-version: "1.20"
 authors:
   - DaniDipp
-description: "Plugin template for Paper"
+description: "Paper Plugin for interacting with Pocketbase"
+dependencies:
+    server:
+        MagicSpells:
+            load: BEFORE
+            required: false

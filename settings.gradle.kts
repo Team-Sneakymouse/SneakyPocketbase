@@ -1,1 +1,2 @@
-rootProject.name = "PaperPlugin"
+rootProject.name = "SneakyPocketbase"
+includeBuild("../Forks/pocketbase-kotlin")
