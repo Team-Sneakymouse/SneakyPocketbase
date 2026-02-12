@@ -4,10 +4,9 @@ import io.github.agrevster.pocketbaseKotlin.PocketbaseClient
 import org.bukkit.Bukkit
 import org.bukkit.plugin.java.JavaPlugin
 import kotlinx.coroutines.*
-import org.bukkit.scheduler.BukkitTask
 
 class SneakyPocketbase : JavaPlugin() {
-    private lateinit var pbHandler: PocketbaseHandler
+    lateinit var pbHandler: PocketbaseHandler
 
     fun pb(): PocketbaseClient {
         if (::pbHandler.isInitialized) {
@@ -27,26 +26,25 @@ class SneakyPocketbase : JavaPlugin() {
         }
     }
 
-    public fun subscribeAsync(subscriptionName: String) {
+    fun subscribeAsync(subscriptionName: String) {
         asyncScope.launch {
             subscribe(subscriptionName)
         }
     }
-    public suspend fun subscribe(subscriptionName: String) {
+    suspend fun subscribe(subscriptionName: String) {
         pb().realtime.subscribe(subscriptionName)
     }
-    public fun unsubscribeAsync(subscriptionName: String) {
+    fun unsubscribeAsync(subscriptionName: String) {
         asyncScope.launch {
             unsubscribe(subscriptionName)
         }
     }
-    public suspend fun unsubscribe(subscriptionName: String) {
+    suspend fun unsubscribe(subscriptionName: String) {
         pb().realtime.unsubscribe(subscriptionName)
     }
 
-
-
     override fun onLoad() {
+        logger.info("Loading SneakyPocketbase")
         instance = this
 
         saveDefaultConfig()
@@ -54,30 +52,45 @@ class SneakyPocketbase : JavaPlugin() {
         val pbHost = config.getString("pocketbase.host")
         val pbUser = config.getString("pocketbase.user")
         val pbPassword = config.getString("pocketbase.password")
+        val serverName = config.getString("serverName", null)?.ifEmpty { null }
 
         if (pbHost.isNullOrEmpty() || pbUser.isNullOrEmpty() || pbPassword.isNullOrEmpty()) {
             logger.severe("Missing Pocketbase configuration")
             server.pluginManager.disablePlugin(this)
             return
         }
-        pbHandler = PocketbaseHandler(logger, pbProtocol, pbHost, pbUser, pbPassword)
+        pbHandler = PocketbaseHandler(logger, pbProtocol, pbHost, pbUser, pbPassword, serverName)
+        logger.info("SneakyPocketbase loaded")
     }
     override fun onEnable() {
+        if (!isEnabled || !::pbHandler.isInitialized) {
+            logger.warning("Plugin is disabled. Skipping onEnable.")
+            return
+        }
         loadConfig()
         Bukkit.getServer().commandMap.registerAll(IDENTIFIER, listOf(
-            ReloadCommand()
+            ReloadCommand(),
+            StatusCommand(),
         ))
         pbHandler.runRealtime()
     }
     fun loadConfig() {
         if (Bukkit.getPluginManager().isPluginEnabled("MagicSpells")) {
-            val variableList = config.getStringList("variables")
-            if (variableList.isEmpty()) {
+            val configVariableSection = config.getConfigurationSection("variables")
+            val configVariables = configVariableSection?.getKeys(false) ?: emptySet()
+            if (configVariableSection == null || configVariables.isEmpty()) {
+                MSVariableSync.unregisterAll()
                 config.set("variables", listOf<String>())
             } else {
                 MSVariableSync.unregisterAll()
-                variableList.forEach {
-                    MSVariableSync.register(it, MSVariableSync.SyncType.PUSH)
+                configVariables.forEach {
+                    val value = configVariableSection.getString(it) ?: return@forEach
+                    MSVariableSync.register(it, MSVariableSync.SyncType.valueOf(value))
+                }
+            }
+            for (variable in MSVariableSync.variables.keys) {
+                if (!configVariables.contains(variable)) {
+                    MSVariableSync.unregister(variable)
                 }
             }
         }
@@ -102,6 +115,9 @@ class SneakyPocketbase : JavaPlugin() {
         val asyncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
         fun getInstance(): SneakyPocketbase {
+            if(!::instance.isInitialized) {
+                throw IllegalStateException("Plugin not initialized yet")
+            }
             return instance
         }
     }

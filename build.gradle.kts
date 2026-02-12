@@ -18,7 +18,7 @@ repositories {
 dependencies {
 	implementation("org.jetbrains.kotlin:kotlin-stdlib:2.1.0")
 	compileOnly("io.papermc.paper:paper-api:1.20.6-R0.1-SNAPSHOT")
-	implementation("io.github.agrevster:pocketbase-kotlin:2.6.3")
+	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
 	compileOnly(files("libs/MagicSpells-4.0-Beta-13.jar"))
 }
 

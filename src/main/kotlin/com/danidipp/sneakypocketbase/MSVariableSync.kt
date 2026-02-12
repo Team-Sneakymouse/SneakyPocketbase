@@ -1,12 +1,19 @@
 package com.danidipp.sneakypocketbase
 
 import com.nisovin.magicspells.MagicSpells
+import com.nisovin.magicspells.util.magicitems.MagicItems
 import com.nisovin.magicspells.variables.variabletypes.GlobalStringVariable
 import com.nisovin.magicspells.variables.variabletypes.GlobalVariable
+import com.nisovin.magicspells.variables.variabletypes.PlayerVariable
 import io.github.agrevster.pocketbaseKotlin.dsl.query.Filter
+import io.github.agrevster.pocketbaseKotlin.services.RealtimeService
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import org.bukkit.Bukkit
+import org.bukkit.event.EventHandler
+import org.bukkit.event.HandlerList
+import org.bukkit.event.Listener
 import org.bukkit.scheduler.BukkitTask
 
 class MSVariableSync {
@@ -95,7 +102,7 @@ class MSVariableSync {
 
                 if (type == SyncType.PULL) {
                     // Pull the variable from the db
-                    // TODO: Move to realtime
+                    // Implemented in realtime
                 }
 
                 if (type == SyncType.BOTH) {
@@ -104,13 +111,39 @@ class MSVariableSync {
                 }
             }
         }
+        private val listener = object : Listener {
+            @EventHandler
+            fun onRecordUpdate(event: AsyncPocketbaseEvent) {
+                if (event.collectionName != "lom2_magicspells") return
+                val record = event.data.parseRecord<MagicSpellsRecord>(kotlinx.serialization.json.Json { ignoreUnknownKeys = true })
+                SneakyPocketbase.getInstance().logger.info("Received lom2_magicspells event: ${record.variable} = ${record.value}")
+                val type = variables[record.variable] ?: return
+                if (type != SyncType.PULL) return // TODO: handle SyncType.BOTH
+                if (!Bukkit.getPluginManager().isPluginEnabled("MagicSpells")) return
+                if (!MagicSpells.isLoaded()) return
+                val variable = MagicSpells.getVariableManager().getVariable(record.variable)
+                if (variable == null) {
+                    SneakyPocketbase.getInstance().logger.severe("Couldn't update variable ${record.variable}: variable not found")
+                    return
+                }
+                variable.set("null", record.value.toDouble())
+            }
+        }
         private fun startSync() {
             if (syncTask != null) return
             syncTask = Bukkit.getScheduler().runTaskTimer(SneakyPocketbase.getInstance(), sync, 0, 20 * 15)
+            Bukkit.getPluginManager().registerEvents(listener, SneakyPocketbase.getInstance())
+            SneakyPocketbase.getInstance().onPocketbaseLoaded {
+                SneakyPocketbase.getInstance().logger.info("Subscribing to lom2_magicspells for variable sync")
+                SneakyPocketbase.getInstance().subscribeAsync("lom2_magicspells")
+            }
+
         }
         fun stopSync() {
             syncTask?.cancel()
             syncTask = null
+            HandlerList.unregisterAll(listener)
+            SneakyPocketbase.getInstance().unsubscribeAsync("lom2_magicspells")
         }
 
         fun register(name: String, type: SyncType) {
