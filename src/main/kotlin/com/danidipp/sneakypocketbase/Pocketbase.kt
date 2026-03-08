@@ -50,7 +50,7 @@ class PocketbaseHandler {
         }
 
         status = "Authenticating"
-        authWait = GlobalScope.async {
+        authWait = SneakyPocketbase.asyncScope.async {
             val token = pocketbase.records.authWithPassword<AuthRecord>("_superusers", pbUser, pbPassword).token
             pocketbase.login { this.token = token }
             isAuthenticated = true
@@ -64,8 +64,11 @@ class PocketbaseHandler {
     }
 
     fun onLoaded(callback: java.lang.Runnable) {
-        authWait.invokeOnCompletion {
-            callback.run()
+        authWait.invokeOnCompletion { cause ->
+            // cause can be null (normal completion), CancellationException (cancelled), or a general error
+            if (cause == null && SneakyPocketbase.getInstance().isEnabled) {
+                callback.run()
+            }
         }
     }
 
@@ -74,6 +77,7 @@ class PocketbaseHandler {
         runBlocking {
             realtimeJob?.cancelAndJoin()
             realtimeJob = null
+            authWait.cancelAndJoin()
 
             logger.info("Disconnecting from Pocketbase Realtime")
             runCatching {

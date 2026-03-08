@@ -8,6 +8,10 @@ import kotlinx.coroutines.*
 class SneakyPocketbase : JavaPlugin() {
     lateinit var pbHandler: PocketbaseHandler
 
+    fun hasPocketbaseHandler(): Boolean {
+        return ::pbHandler.isInitialized
+    }
+
     fun pb(): PocketbaseClient {
         if (::pbHandler.isInitialized) {
             return pbHandler.pocketbase
@@ -46,6 +50,7 @@ class SneakyPocketbase : JavaPlugin() {
     override fun onLoad() {
         logger.info("Loading SneakyPocketbase")
         instance = this
+        resetAsyncScope()
 
         saveDefaultConfig()
         val pbProtocol = config.getString("pocketbase.protocol", "http")!!
@@ -98,11 +103,14 @@ class SneakyPocketbase : JavaPlugin() {
 
     override fun onDisable() {
         logger.info("Disabling SneakyPocketbase")
-        asyncScope.cancel()
         MSVariableSync.stopSync()
 
-        logger.info("Shutting down Pocketbase")
-        pbHandler.stop()
+        if (::pbHandler.isInitialized) {
+            logger.info("Shutting down Pocketbase")
+            pbHandler.stop()
+        }
+
+        shutdownAsyncScope()
     }
 
     companion object {
@@ -111,14 +119,30 @@ class SneakyPocketbase : JavaPlugin() {
         const val VERSION = "1.0"
         private lateinit var instance: SneakyPocketbase
         val preInitLoadedCallbacks = mutableListOf<java.lang.Runnable>()
+        private var asyncScopeRef: CoroutineScope? = null
 
-        val asyncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val asyncScope: CoroutineScope
+            get() = asyncScopeRef ?: throw IllegalStateException("Async scope not initialized")
 
         fun getInstance(): SneakyPocketbase {
             if(!::instance.isInitialized) {
                 throw IllegalStateException("Plugin not initialized yet")
             }
             return instance
+        }
+
+        private fun createAsyncScope(): CoroutineScope {
+            return CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+
+        fun resetAsyncScope() {
+            asyncScopeRef?.cancel()
+            asyncScopeRef = createAsyncScope()
+        }
+
+        fun shutdownAsyncScope() {
+            asyncScopeRef?.cancel()
+            asyncScopeRef = null
         }
     }
 }

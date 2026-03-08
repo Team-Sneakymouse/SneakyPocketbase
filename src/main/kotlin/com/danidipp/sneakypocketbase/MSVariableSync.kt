@@ -143,7 +143,17 @@ class MSVariableSync {
             syncTask?.cancel()
             syncTask = null
             HandlerList.unregisterAll(listener)
-            SneakyPocketbase.getInstance().unsubscribeAsync("lom2_magicspells")
+            val plugin = SneakyPocketbase.getInstance()
+            if (!plugin.hasPocketbaseHandler()) return
+
+            runBlocking {
+                runCatching {
+                    plugin.unsubscribe("lom2_magicspells")
+                }.onFailure {
+                    plugin.logger.warning("Failed to unsubscribe from lom2_magicspells during shutdown")
+                    plugin.logger.fine(it.stackTraceToString())
+                }
+            }
         }
 
         fun register(name: String, type: SyncType) {
