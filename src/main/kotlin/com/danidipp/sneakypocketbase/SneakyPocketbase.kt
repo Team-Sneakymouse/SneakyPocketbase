@@ -32,19 +32,37 @@ class SneakyPocketbase : JavaPlugin() {
 
     fun subscribeAsync(subscriptionName: String) {
         asyncScope.launch {
-            subscribe(subscriptionName)
+            runCatching {
+                subscribe(subscriptionName)
+            }.onFailure {
+                logger.warning("Failed to subscribe to Pocketbase Realtime '$subscriptionName'")
+                logger.fine(it.stackTraceToString())
+            }
         }
     }
     suspend fun subscribe(subscriptionName: String) {
-        pb().realtime.subscribe(subscriptionName)
+        if (::pbHandler.isInitialized) {
+            pbHandler.subscribe(subscriptionName)
+        } else {
+            throw IllegalStateException("Pocketbase not loaded yet")
+        }
     }
     fun unsubscribeAsync(subscriptionName: String) {
         asyncScope.launch {
-            unsubscribe(subscriptionName)
+            runCatching {
+                unsubscribe(subscriptionName)
+            }.onFailure {
+                logger.warning("Failed to unsubscribe from Pocketbase Realtime '$subscriptionName'")
+                logger.fine(it.stackTraceToString())
+            }
         }
     }
     suspend fun unsubscribe(subscriptionName: String) {
-        pb().realtime.unsubscribe(subscriptionName)
+        if (::pbHandler.isInitialized) {
+            pbHandler.unsubscribe(subscriptionName)
+        } else {
+            throw IllegalStateException("Pocketbase not loaded yet")
+        }
     }
 
     override fun onLoad() {
