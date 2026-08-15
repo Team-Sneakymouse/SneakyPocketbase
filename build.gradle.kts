@@ -1,6 +1,6 @@
 plugins {
-	kotlin("jvm") version "2.1.0"
-	kotlin("plugin.serialization") version "2.1.0"
+	kotlin("jvm") version "2.2.21"
+	kotlin("plugin.serialization") version "2.2.21"
 	id("com.gradleup.shadow") version "8.3.6"
 }
 
@@ -16,7 +16,7 @@ repositories {
 }
 
 dependencies {
-	implementation("org.jetbrains.kotlin:kotlin-stdlib:2.1.0")
+	implementation(kotlin("stdlib"))
 	compileOnly("io.papermc.paper:paper-api:1.20.6-R0.1-SNAPSHOT")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
 	compileOnly(files("libs/MagicSpells-4.0-Beta-13.jar"))
@@ -32,20 +32,14 @@ configure<JavaPluginExtension> {
 }
 
 tasks.shadowJar {
-	archiveClassifier.set("") // Ensures this is the main JAR
+	archiveClassifier.set("")
 	mergeServiceFiles()
-	relocate("kotlin", "com.danidipp.sneakypocketbase.kotlin") // Prevents conflicts
 }
 
 tasks.jar {
-	manifest {
-		attributes["Main-Class"] = "com.danidipp.sneakypocketbase.SneakyPocketbase"
-	}
-	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-
-	from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
+	enabled = false
 }
 
 tasks.build {
-//	dependsOn(tasks.shadowJar)
+	dependsOn(tasks.shadowJar)
 }
