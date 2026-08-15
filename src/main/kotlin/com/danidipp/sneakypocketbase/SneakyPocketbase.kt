@@ -6,13 +6,20 @@ import org.bukkit.plugin.java.JavaPlugin
 import kotlinx.coroutines.*
 
 class SneakyPocketbase : JavaPlugin() {
-    lateinit var pbHandler: PocketbaseHandler
+    internal lateinit var pbHandler: PocketbaseHandler
+    private val consumerApi: PocketbaseApi = PocketbaseApiAdapter(
+        scope = { asyncScope },
+        client = { pb() },
+        ready = { onPocketbaseLoaded(it) },
+        subscribeAction = { subscribe(it) },
+        unsubscribeAction = { unsubscribe(it) },
+    )
 
     fun hasPocketbaseHandler(): Boolean {
         return ::pbHandler.isInitialized
     }
 
-    fun pb(): PocketbaseClient {
+    internal fun pb(): PocketbaseClient {
         if (::pbHandler.isInitialized) {
             return pbHandler.pocketbase
         } else {
@@ -20,15 +27,24 @@ class SneakyPocketbase : JavaPlugin() {
         }
     }
 
+    /**
+     * Registers a callback that runs after Pocketbase authentication completes.
+     *
+     * This is a Pocketbase callback, not a Bukkit callback: callbacks are always
+     * scheduled on [asyncScope]. Callers that touch Bukkit or other main-thread
+     * APIs must switch to the Bukkit main thread themselves.
+     */
     fun onPocketbaseLoaded(callback: java.lang.Runnable) {
         if (::pbHandler.isInitialized) {
-            logger.fine("Pocketbase already loaded. Registering callback directly.")
+            logger.fine("Pocketbase handler initialized. Registering callback on Pocketbase async scope.")
             pbHandler.onLoaded(callback)
         } else {
-            val msg = "Pocketbase not loaded yet. Registering callback for later."
-            preInitLoadedCallbacks.add(callback)
+            logger.fine("Pocketbase handler not initialized yet. Registering callback for later.")
+            addPreInitLoadedCallback(callback)
         }
     }
+
+    fun api(): PocketbaseApi = consumerApi
 
     fun subscribeAsync(subscriptionName: String) {
         asyncScope.launch {
@@ -40,7 +56,7 @@ class SneakyPocketbase : JavaPlugin() {
             }
         }
     }
-    suspend fun subscribe(subscriptionName: String) {
+    internal suspend fun subscribe(subscriptionName: String) {
         if (::pbHandler.isInitialized) {
             pbHandler.subscribe(subscriptionName)
         } else {
@@ -57,7 +73,7 @@ class SneakyPocketbase : JavaPlugin() {
             }
         }
     }
-    suspend fun unsubscribe(subscriptionName: String) {
+    internal suspend fun unsubscribe(subscriptionName: String) {
         if (::pbHandler.isInitialized) {
             pbHandler.unsubscribe(subscriptionName)
         } else {
@@ -68,21 +84,14 @@ class SneakyPocketbase : JavaPlugin() {
     override fun onLoad() {
         logger.info("Loading SneakyPocketbase")
         instance = this
+        PocketbaseProvider.install(consumerApi)
         resetAsyncScope()
 
         saveDefaultConfig()
-        val pbProtocol = config.getString("pocketbase.protocol", "http")!!
-        val pbHost = config.getString("pocketbase.host")
-        val pbUser = config.getString("pocketbase.user")
-        val pbPassword = config.getString("pocketbase.password")
-        val serverName = config.getString("serverName", null)?.ifEmpty { null }
-
-        if (pbHost.isNullOrEmpty() || pbUser.isNullOrEmpty() || pbPassword.isNullOrEmpty()) {
-            logger.severe("Missing Pocketbase configuration")
+        if (!initializePocketbase()) {
             server.pluginManager.disablePlugin(this)
             return
         }
-        pbHandler = PocketbaseHandler(logger, pbProtocol, pbHost, pbUser, pbPassword, serverName)
         logger.info("SneakyPocketbase loaded")
     }
     override fun onEnable() {
@@ -101,25 +110,70 @@ class SneakyPocketbase : JavaPlugin() {
         if (Bukkit.getPluginManager().isPluginEnabled("MagicSpells")) {
             val configVariableSection = config.getConfigurationSection("variables")
             val configVariables = configVariableSection?.getKeys(false) ?: emptySet()
-            if (configVariableSection == null || configVariables.isEmpty()) {
-                MSVariableSync.unregisterAll()
-                config.set("variables", listOf<String>())
+            val configuredVariables = if (configVariableSection == null || configVariables.isEmpty()) {
+                emptyMap()
             } else {
-                MSVariableSync.unregisterAll()
-                configVariables.forEach {
-                    val value = configVariableSection.getString(it) ?: return@forEach
-                    MSVariableSync.register(it, MSVariableSync.SyncType.valueOf(value))
-                }
+                configVariables.associateWith { configVariableSection.getString(it) }
             }
-            for (variable in MSVariableSync.variables.keys) {
-                if (!configVariables.contains(variable)) {
-                    MSVariableSync.unregister(variable)
-                }
+
+            val parseResult = MSVariableSync.parsePolicy(configuredVariables)
+            for ((variable, error) in parseResult.errors) {
+                logger.warning("Ignoring MagicSpells variable sync config for $variable: $error")
             }
+            MSVariableSync.applyPolicy(parseResult.policy)
+        } else {
+            MSVariableSync.applyPolicy(MSVariableSync.VariableSyncPolicy.EMPTY)
         }
     }
 
+    fun restartPocketbase(): Boolean {
+        val settings = readPocketbaseSettings() ?: return false
+
+        if (::pbHandler.isInitialized) {
+            logger.info("Restarting Pocketbase")
+            pbHandler.stop()
+        }
+
+        pbHandler = createPocketbaseHandler(settings)
+        pbHandler.runRealtime()
+        return true
+    }
+
+    private fun initializePocketbase(): Boolean {
+        val settings = readPocketbaseSettings() ?: return false
+        pbHandler = createPocketbaseHandler(settings)
+        return true
+    }
+
+    private fun readPocketbaseSettings(): PocketbaseSettings? {
+        val pbProtocol = config.getString("pocketbase.protocol", "http")!!
+        val pbHost = config.getString("pocketbase.host")
+        val pbUser = config.getString("pocketbase.user")
+        val pbPassword = config.getString("pocketbase.password")
+        val serverName = config.getString("serverName", null)?.ifEmpty { null }
+
+        if (pbHost.isNullOrEmpty() || pbUser.isNullOrEmpty() || pbPassword.isNullOrEmpty()) {
+            logger.severe("Missing Pocketbase configuration")
+            return null
+        }
+
+        return PocketbaseSettings(pbProtocol, pbHost, pbUser, pbPassword, serverName)
+    }
+
+    private fun createPocketbaseHandler(settings: PocketbaseSettings): PocketbaseHandler {
+        return PocketbaseHandler(
+            logger,
+            settings.protocol,
+            settings.host,
+            settings.user,
+            settings.password,
+            settings.serverName,
+        )
+    }
+
     override fun onDisable() {
+        PocketbaseProvider.clear()
+        stopPocketbaseLoadedCallbacks()
         logger.info("Disabling SneakyPocketbase")
         MSVariableSync.stopSync()
 
@@ -136,8 +190,10 @@ class SneakyPocketbase : JavaPlugin() {
         const val AUTHORS = "Team Sneakymouse"
         const val VERSION = "1.0"
         private lateinit var instance: SneakyPocketbase
-        val preInitLoadedCallbacks = mutableListOf<java.lang.Runnable>()
+        private val preInitLoadedCallbacks = mutableListOf<java.lang.Runnable>()
         private var asyncScopeRef: CoroutineScope? = null
+        @Volatile
+        private var acceptingPocketbaseLoadedCallbacks = false
 
         val asyncScope: CoroutineScope
             get() = asyncScopeRef ?: throw IllegalStateException("Async scope not initialized")
@@ -156,31 +212,43 @@ class SneakyPocketbase : JavaPlugin() {
         fun resetAsyncScope() {
             asyncScopeRef?.cancel()
             asyncScopeRef = createAsyncScope()
+            acceptingPocketbaseLoadedCallbacks = true
         }
 
         fun shutdownAsyncScope() {
+            acceptingPocketbaseLoadedCallbacks = false
             asyncScopeRef?.cancel()
             asyncScopeRef = null
         }
-    }
-}
 
-/**
- * Makes a coroutine runnable in a Bukkit async task.
- * Usage:
- * ```
- * val task = Bukkit.getScheduler().runTaskAsynchronously(plugin, PBRunnable(scope) {
- *     // Your code here
- * })
- * ```
- */
-class PBRunnable(
-    private val scope: CoroutineScope = SneakyPocketbase.asyncScope,
-    private val coroutine: suspend CoroutineScope.() -> Unit
-) : java.lang.Runnable {
-    override fun run() {
-        scope.launch {
-            coroutine()
+        fun stopPocketbaseLoadedCallbacks() {
+            acceptingPocketbaseLoadedCallbacks = false
+        }
+
+        fun pocketbaseLoadedCallbackScopeOrNull(): CoroutineScope? {
+            return asyncScopeRef?.takeIf { acceptingPocketbaseLoadedCallbacks && it.isActive }
+        }
+
+        fun addPreInitLoadedCallback(callback: java.lang.Runnable) {
+            synchronized(preInitLoadedCallbacks) {
+                preInitLoadedCallbacks.add(callback)
+            }
+        }
+
+        fun drainPreInitLoadedCallbacks(): List<java.lang.Runnable> {
+            return synchronized(preInitLoadedCallbacks) {
+                preInitLoadedCallbacks.toList().also {
+                    preInitLoadedCallbacks.clear()
+                }
+            }
         }
     }
+
+    private data class PocketbaseSettings(
+        val protocol: String,
+        val host: String,
+        val user: String,
+        val password: String,
+        val serverName: String?,
+    )
 }

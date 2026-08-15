@@ -21,7 +21,7 @@ class PocketbaseHandler {
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val RECONNECT_DELAY_MS = 30_000L
         private const val LISTENER_START_DELAY_MS = 500L
-        private const val JOB_JOIN_TIMEOUT_MS = 5_000L
+        private const val LIFECYCLE_TIMEOUT_MS = 1_000L
     }
 
     val pocketbase: PocketbaseClient
@@ -62,18 +62,41 @@ class PocketbaseHandler {
             isAuthenticated = true
         }
         logger.fine("Registering pre-init loaded callbacks")
-        for (callback in SneakyPocketbase.preInitLoadedCallbacks) {
+        for (callback in SneakyPocketbase.drainPreInitLoadedCallbacks()) {
             onLoaded(callback)
         }
-        SneakyPocketbase.preInitLoadedCallbacks.clear()
         status = "Initialized"
     }
 
     fun onLoaded(callback: java.lang.Runnable) {
         authWait.invokeOnCompletion { cause ->
             // cause can be null (normal completion), CancellationException (cancelled), or a general error
-            if (cause == null && SneakyPocketbase.getInstance().isEnabled) {
+            if (cause == null) {
+                scheduleLoadedCallback(callback)
+            }
+        }
+    }
+
+    private fun scheduleLoadedCallback(callback: java.lang.Runnable) {
+        val scope = SneakyPocketbase.pocketbaseLoadedCallbackScopeOrNull()
+        if (scope == null) {
+            logger.fine("Skipping Pocketbase loaded callback because callback execution is stopped")
+            return
+        }
+
+        scope.launch(CoroutineName("PocketbaseLoadedCallback")) {
+            if (SneakyPocketbase.pocketbaseLoadedCallbackScopeOrNull() == null) {
+                logger.fine("Skipping Pocketbase loaded callback because callback execution stopped before execution")
+                return@launch
+            }
+
+            runCatching {
                 callback.run()
+            }.onFailure {
+                if (it !is CancellationException) {
+                    logger.warning("Pocketbase loaded callback failed")
+                    logger.fine(it.stackTraceToString())
+                }
             }
         }
     }
@@ -153,7 +176,6 @@ class PocketbaseHandler {
         status = "Authentication failed"
         logger.severe("Failed to authenticate with Pocketbase")
         logger.severe(failure.stackTraceToString())
-        Bukkit.getPluginManager().disablePlugin(SneakyPocketbase.getInstance())
         return false
     }
 
@@ -178,9 +200,9 @@ class PocketbaseHandler {
             } else if (!hasEstablishedConnection) {
                 startupFailures++
                 if (startupFailures >= MAX_RECONNECT_ATTEMPTS) {
+                    status = "Realtime startup failed"
                     logger.severe("Failed to connect to Pocketbase Realtime after $MAX_RECONNECT_ATTEMPTS tries")
                     result.failure?.let { logger.severe(it.stackTraceToString()) }
-                    Bukkit.getPluginManager().disablePlugin(SneakyPocketbase.getInstance())
                     return
                 }
             }
@@ -231,7 +253,14 @@ class PocketbaseHandler {
                     val collectionName = record.collectionName ?: ""
                     logger.fine("Received Pocketbase Realtime event on ${collectionName}: $action, ${record.id}")
                     Bukkit.getScheduler().runTaskAsynchronously(SneakyPocketbase.getInstance(), Runnable {
-                        Bukkit.getPluginManager().callEvent(AsyncPocketbaseEvent(true, action, collectionName, this))
+                        Bukkit.getPluginManager().callEvent(
+                            AsyncPocketbaseEvent(
+                                true,
+                                AsyncPocketbaseEvent.Action.valueOf(action.name),
+                                collectionName,
+                                this.record.toString(),
+                            )
+                        )
                     })
                 }
             }.onSuccess {
@@ -248,9 +277,11 @@ class PocketbaseHandler {
         val failure = try {
             sessionEnded.await()
         } finally {
-            disconnectRealtime()
-            cancelAndJoinSafely(listenerJob, "Pocketbase Realtime listener")
-            cancelAndJoinSafely(connectJob, "Pocketbase Realtime connector")
+            withContext(NonCancellable) {
+                disconnectRealtime()
+                cancelAndJoinSafely(listenerJob, "Pocketbase Realtime listener")
+                cancelAndJoinSafely(connectJob, "Pocketbase Realtime connector")
+            }
         }
 
         RealtimeSessionResult(
@@ -260,15 +291,35 @@ class PocketbaseHandler {
     }
 
     private suspend fun disconnectRealtime(warningMessage: String? = null) {
+        var timedOut = false
         val failure = runCatching {
-            pocketbase.realtime.disconnect()
+            val disconnectJob = SneakyPocketbase.asyncScope.async(CoroutineName("PocketbaseRealtimeDisconnect")) {
+                pocketbase.realtime.disconnect()
+            }
+            val completed = withTimeoutOrNull(LIFECYCLE_TIMEOUT_MS) {
+                disconnectJob.await()
+                true
+            } ?: false
+            if (!completed) {
+                timedOut = true
+                disconnectJob.cancel()
+            }
         }.exceptionOrNull()
+
+        if (timedOut) {
+            val message = warningMessage ?: "Timed out while disconnecting from Pocketbase Realtime"
+            logger.warning("$message after ${LIFECYCLE_TIMEOUT_MS}ms")
+            markDisconnected()
+            forceResetRealtimeState()
+            return
+        }
 
         if (failure != null && failure !is CancellationException) {
             if (warningMessage != null) {
                 logger.warning(warningMessage)
                 logger.fine(failure.stackTraceToString())
             }
+            markDisconnected()
             forceResetRealtimeState()
         }
     }
@@ -331,7 +382,7 @@ class PocketbaseHandler {
     private suspend fun cancelAndJoinSafely(job: Job?, description: String) {
         if (job == null) return
         job.cancel()
-        val joined = withTimeoutOrNull(JOB_JOIN_TIMEOUT_MS) {
+        val joined = withTimeoutOrNull(LIFECYCLE_TIMEOUT_MS) {
             job.join()
             true
         } ?: false

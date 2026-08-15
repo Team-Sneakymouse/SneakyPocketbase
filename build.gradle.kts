@@ -41,5 +41,47 @@ tasks.jar {
 }
 
 tasks.build {
-	dependsOn(tasks.shadowJar)
+	dependsOn(tasks.shadowJar, "apiJar")
+}
+
+val apiJar by tasks.registering(Jar::class) {
+	dependsOn(tasks.classes)
+	archiveClassifier.set("api")
+	from(sourceSets.main.get().output) {
+		include("com/danidipp/sneakypocketbase/PocketbaseApi.class")
+		include("com/danidipp/sneakypocketbase/PocketbaseProvider.class")
+		include("com/danidipp/sneakypocketbase/AsyncPocketbaseEvent.class")
+		include("com/danidipp/sneakypocketbase/AsyncPocketbaseEvent${'$'}Action.class")
+	}
+}
+
+val verifyConsumerApi by tasks.registering {
+	dependsOn(apiJar)
+	doLast {
+		val apiClasses = listOf(
+			"com.danidipp.sneakypocketbase.PocketbaseApi",
+			"com.danidipp.sneakypocketbase.PocketbaseProvider",
+			"com.danidipp.sneakypocketbase.AsyncPocketbaseEvent",
+			"com.danidipp.sneakypocketbase.AsyncPocketbaseEvent${'$'}Action",
+		)
+		val result = providers.exec {
+			commandLine(
+				javaToolchains.launcherFor(java.toolchain).get().metadata.installationPath
+					.file("bin/javap.exe").asFile.absolutePath,
+				"-public",
+				"-classpath",
+				apiJar.get().archiveFile.get().asFile.absolutePath,
+				*apiClasses.toTypedArray(),
+			)
+		}
+		val publicApi = result.standardOutput.asText.get()
+		val forbidden = listOf("kotlin.", "kotlinx.", "pocketbaseKotlin")
+		check(forbidden.none(publicApi::contains)) {
+			"Consumer API exposes an implementation type:\n$publicApi"
+		}
+	}
+}
+
+tasks.check {
+	dependsOn(verifyConsumerApi)
 }

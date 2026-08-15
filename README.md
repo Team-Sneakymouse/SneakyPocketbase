@@ -1,37 +1,51 @@
 # SneakyPocketbase
 
-Paper plugin providing shared PocketBase access and asynchronous execution facilities for other Sneaky plugins.
+Paper plugin providing PocketBase access and asynchronous execution facilities for other Sneaky plugins.
 
-## Consumer setup
+## Consumer interface
 
-SneakyPocketbase owns the server runtime copies of Kotlin, Kotlin coroutines, and the PocketBase client. Consumer plugins compile against the same SneakyPocketbase JAR that will be deployed, but must not package their own copies of these libraries. Two classes with the same Kotlin class name are incompatible when Paper loads them through different plugin classloaders.
-
-SneakyPocketbase currently builds with Kotlin `2.2.21`. Consumers should use the same Kotlin compiler version and disable the Kotlin Gradle plugin's automatic standard-library dependency:
-
-```properties
-# gradle.properties
-kotlin.stdlib.default.dependency=false
-```
-
-Add the deployed SneakyPocketbase artifact as a compile-only dependency. Do not also declare `kotlin-stdlib` as a consumer dependency:
+Consumers must enter through `PocketbaseProvider.getApi()`. The returned `PocketbaseApi` interface uses only JDK types: JSON strings, `Runnable`, collections, and `CompletableFuture`.
 
 ```kotlin
-// build.gradle.kts
-dependencies {
-    compileOnly(files("../SneakyPocketbase/build/libs/SneakyPocketbase-1.0.jar"))
+val pocketbase = PocketbaseProvider.getApi()
+
+pocketbase.whenReady {
+    pocketbase.subscribe("example_collection")
+}
+
+val records: List<String> = pocketbase.getFullList(
+    "example_collection",
+    100,
+    "-created",
+    "enabled = true",
+).join()
+```
+
+Realtime updates are published as `AsyncPocketbaseEvent`. Its action is the Java `AsyncPocketbaseEvent.Action` enum, and `recordJson` contains the raw record JSON for the consumer to deserialize.
+
+```kotlin
+@EventHandler
+fun onPocketbaseUpdate(event: AsyncPocketbaseEvent) {
+    if (event.collectionName != "example_collection") return
+    val record = Json.decodeFromString<ExampleRecord>(event.recordJson)
 }
 ```
 
-Exclude Kotlin and kotlinx libraries brought in transitively by other dependencies. Apply these exclusions to every dependency configuration that contributes classes to the consumer JAR, not only to compile-time APIs. For example:
+Consumers must not use implementation classes or types from:
 
-```kotlin
-compileOnly("example:another-plugin-api:1.0") {
-    exclude(group = "org.jetbrains.kotlin")
-    exclude(group = "org.jetbrains.kotlinx")
-}
-```
+- `PBRunnable`
+- `SneakyPocketbase.asyncScope`
+- `SneakyPocketbase.pb()`
+- `PocketbaseClient`
+- `BaseRecord`
+- `kotlin.coroutines` or `kotlinx.coroutines` across the plugin seam
+- PocketBase Kotlin query, model, serializer, or realtime types across the plugin seam
 
-Declare the runtime relationship in `paper-plugin.yml` so Paper loads SneakyPocketbase first and makes its classes visible to the consumer:
+The implementation may use Kotlin, coroutines, Ktor, serialization, and the PocketBase Kotlin client internally. Those types are intentionally absent from the consumer interface because Paper plugins have isolated classloaders; equal class names loaded separately are not equal JVM classes.
+
+## Paper dependency
+
+Consumers must declare SneakyPocketbase as a required dependency and join its classpath so the Java-compatible interface classes are visible:
 
 ```yaml
 dependencies:
@@ -42,23 +56,24 @@ dependencies:
       join-classpath: true
 ```
 
-### Packaging invariant
+Compile against the same SneakyPocketbase artifact that will be deployed:
 
-The deployed artifacts must satisfy all of the following:
-
-- SneakyPocketbase contains the unrelocated `kotlin/**` and `kotlinx/coroutines/**` runtime classes.
-- A consumer contains no `kotlin/**` or `kotlinx/coroutines/**` classes.
-- A consumer compiles against the exact SneakyPocketbase artifact deployed with it.
-- Dependencies joined to the consumer's classpath do not provide another unrelocated Kotlin runtime.
-
-After building, these PowerShell checks should report `1` for SneakyPocketbase and `0` for the consumer:
-
-```powershell
-(& jar tf '..\SneakyPocketbase\build\libs\SneakyPocketbase-1.0.jar' |
-    Select-String '^kotlin/jvm/functions/Function2.class$').Count
-
-(& jar tf 'build\libs\ConsumerPlugin-1.0.jar' |
-    Select-String '^(kotlin/|kotlinx/coroutines/)').Count
+```kotlin
+dependencies {
+    compileOnly(files("../SneakyPocketbase/build/libs/SneakyPocketbase-1.0-api.jar"))
+}
 ```
 
-If a consumer throws a `LinkageError` mentioning different `Class` objects for a Kotlin type such as `kotlin.jvm.functions.Function2`, inspect every JAR joined to that consumer's classpath for a second bundled Kotlin runtime.
+Consumers may choose their own internal Kotlin packaging strategy. Compatibility at the SneakyPocketbase seam depends on keeping Kotlin and PocketBase implementation types out of method parameters, return values, callbacks, events, and shared model inheritance—not on sharing a Kotlin runtime between plugin classloaders.
+
+## Interface verification
+
+Deploy `SneakyPocketbase-1.0.jar` on the server. The `-api.jar` is compile-time only and deliberately contains no Kotlin runtime or implementation classes.
+
+`verifyConsumerApi` inspects the compiled Java interface with `javap` and fails if Kotlin, kotlinx, or PocketBase Kotlin implementation types appear. It runs automatically as part of `check`:
+
+```powershell
+./gradlew check
+```
+
+If a linkage error mentions different class objects for `Function2`, `Continuation`, `CoroutineScope`, or another Kotlin type, search the consumer for calls that bypass `PocketbaseApi` or event/model types that expose an implementation dependency.
