@@ -1,6 +1,6 @@
 plugins {
-	kotlin("jvm") version "2.2.21"
-	kotlin("plugin.serialization") version "2.2.21"
+	kotlin("jvm") version "2.3.21"
+	kotlin("plugin.serialization") version "2.3.21"
 	id("com.gradleup.shadow") version "8.3.6"
 }
 
@@ -17,12 +17,19 @@ repositories {
 
 dependencies {
 	implementation(kotlin("stdlib"))
-	compileOnly("io.papermc.paper:paper-api:1.20.6-R0.1-SNAPSHOT")
+	compileOnly("io.papermc.paper:paper-api:26.2.build.117-stable")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
 	compileOnly(files("libs/MagicSpells-4.0-Beta-13.jar"))
+	testImplementation(kotlin("test-junit5"))
+	testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
+	testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.1")
+	testImplementation("io.papermc.paper:paper-api:26.2.build.117-stable")
 }
 
+tasks.test { useJUnitPlatform() }
+
 configure<JavaPluginExtension> {
+	toolchain.languageVersion.set(JavaLanguageVersion.of(25))
 	sourceSets {
 		main {
 			java.srcDir("src/main/kotlin")
