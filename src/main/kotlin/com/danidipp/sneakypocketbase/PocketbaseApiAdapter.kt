@@ -12,9 +12,10 @@ import io.ktor.client.statement.HttpResponse
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.http.encodeURLPathPart
-import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -27,11 +28,14 @@ internal class PocketbaseApiAdapter(
     private val ready: (Runnable) -> Unit,
     private val subscribeAction: suspend (String) -> Unit,
     private val unsubscribeAction: suspend (String) -> Unit,
+    private val lifecycle: () -> PocketbaseLifecycleSnapshot,
+    private val operationFailed: (Long, Throwable) -> Unit,
 ) : PocketbaseApi {
     override fun whenReady(callback: Runnable) = ready(callback)
+    override fun getLifecycleSnapshot(): PocketbaseLifecycleSnapshot = lifecycle()
 
-    override fun getOne(collection: String, recordId: String): CompletableFuture<String> = async {
-        client().httpClient.get(recordPath(collection, recordId)).successBody()
+    override fun getOne(collection: String, recordId: String): CompletableFuture<String> = async { currentClient ->
+        withTimeout(30_000) { currentClient.httpClient.get(recordPath(collection, recordId)).successBody() }
     }
 
     override fun getFullList(
@@ -39,16 +43,18 @@ internal class PocketbaseApiAdapter(
         batchSize: Int,
         sort: String,
         filter: String,
-    ): CompletableFuture<List<String>> = async {
+    ): CompletableFuture<List<String>> = async { currentClient ->
         val records = mutableListOf<String>()
         var page = 1
         do {
-            val response = client().httpClient.get(collectionPath(collection)) {
-                parameter("page", page)
-                parameter("perPage", batchSize)
-                if (sort.isNotBlank()) parameter("sort", sort)
-                if (filter.isNotBlank()) parameter("filter", filter)
-            }.successBody()
+            val response = withTimeout(30_000) {
+                currentClient.httpClient.get(collectionPath(collection)) {
+                    parameter("page", page)
+                    parameter("perPage", batchSize)
+                    if (sort.isNotBlank()) parameter("sort", sort)
+                    if (filter.isNotBlank()) parameter("filter", filter)
+                }.successBody()
+            }
             val payload = Json.parseToJsonElement(response).jsonObject
             records += payload.getValue("items").jsonArray.map { it.toString() }
             val totalPages = payload.getValue("totalPages").jsonPrimitive.content.toInt()
@@ -57,25 +63,26 @@ internal class PocketbaseApiAdapter(
         records
     }
 
-    override fun create(collection: String, recordJson: String): CompletableFuture<String> = async {
-        client().httpClient.post(collectionPath(collection)) {
-            contentType(ContentType.Application.Json)
-            setBody(recordJson)
-        }.successBody()
-    }
-
-    override fun update(collection: String, recordId: String, recordJson: String): CompletableFuture<String> = async {
-        client().httpClient.patch(recordPath(collection, recordId)) {
-            contentType(ContentType.Application.Json)
-            setBody(recordJson)
-        }.successBody()
-    }
-
-    override fun delete(collection: String, recordId: String): CompletableFuture<Boolean> = async {
-        val response = client().httpClient.delete(recordPath(collection, recordId))
-        if (!response.status.isSuccess()) {
-            throw IllegalStateException("PocketBase delete failed (${response.status}): ${response.bodyAsText()}")
+    override fun create(collection: String, recordJson: String): CompletableFuture<String> = async { currentClient ->
+        withTimeout(30_000) {
+            currentClient.httpClient.post(collectionPath(collection)) {
+                contentType(ContentType.Application.Json)
+                setBody(recordJson)
+            }.successBody()
         }
+    }
+
+    override fun update(collection: String, recordId: String, recordJson: String): CompletableFuture<String> = async { currentClient ->
+        withTimeout(30_000) {
+            currentClient.httpClient.patch(recordPath(collection, recordId)) {
+                contentType(ContentType.Application.Json)
+                setBody(recordJson)
+            }.successBody()
+        }
+    }
+
+    override fun delete(collection: String, recordId: String): CompletableFuture<Boolean> = async { currentClient ->
+        withTimeout(30_000) { currentClient.httpClient.delete(recordPath(collection, recordId)).requireSuccess() }
         true
     }
 
@@ -85,13 +92,26 @@ internal class PocketbaseApiAdapter(
     override fun unsubscribe(collection: String): CompletableFuture<Void> =
         asyncVoid { unsubscribeAction(collection) }
 
-    private fun <T> async(operation: suspend () -> T): CompletableFuture<T> {
+    private fun <T> async(operation: suspend (PocketbaseClient) -> T): CompletableFuture<T> {
         val future = CompletableFuture<T>()
+        val generation = lifecycle().generation
+        val currentClient = try { client() } catch (failure: Throwable) {
+            future.completeExceptionally(failure)
+            return future
+        }
         val job = try {
             scope().launch {
-                runCatching { operation() }
+                runCatching {
+                    if (lifecycle().generation != generation) throw CancellationException("PocketBase generation changed before execution")
+                    val result = operation(currentClient)
+                    if (lifecycle().generation != generation) throw CancellationException("PocketBase generation changed; discard this result")
+                    result
+                }
                     .onSuccess(future::complete)
-                    .onFailure(future::completeExceptionally)
+                    .onFailure { failure ->
+                        operationFailed(generation, failure)
+                        future.completeExceptionally(failure)
+                    }
             }
         } catch (failure: Throwable) {
             future.completeExceptionally(failure)
@@ -128,10 +148,7 @@ internal class PocketbaseApiAdapter(
         "${collectionPath(collection)}/${recordId.encodeURLPathPart()}"
 
     private suspend fun HttpResponse.successBody(): String {
-        val body = bodyAsText()
-        if (!status.isSuccess()) {
-            throw IllegalStateException("PocketBase request failed ($status): $body")
-        }
-        return body
+        requireSuccess()
+        return bodyAsText()
     }
 }

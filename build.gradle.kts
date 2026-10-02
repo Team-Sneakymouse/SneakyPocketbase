@@ -59,6 +59,8 @@ val apiJar by tasks.registering(Jar::class) {
 		include("com/danidipp/sneakypocketbase/PocketbaseProvider.class")
 		include("com/danidipp/sneakypocketbase/AsyncPocketbaseEvent.class")
 		include("com/danidipp/sneakypocketbase/AsyncPocketbaseEvent${'$'}Action.class")
+		include("com/danidipp/sneakypocketbase/PocketbaseLifecycleSnapshot*.class")
+		include("com/danidipp/sneakypocketbase/AsyncPocketbaseLifecycleEvent.class")
 	}
 }
 
@@ -70,6 +72,12 @@ val verifyConsumerApi by tasks.registering {
 			"com.danidipp.sneakypocketbase.PocketbaseProvider",
 			"com.danidipp.sneakypocketbase.AsyncPocketbaseEvent",
 			"com.danidipp.sneakypocketbase.AsyncPocketbaseEvent${'$'}Action",
+			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot",
+			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot${'$'}ApiState",
+			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot${'$'}TransportState",
+			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot${'$'}SubscriptionState",
+			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot${'$'}CollectionStatus",
+			"com.danidipp.sneakypocketbase.AsyncPocketbaseLifecycleEvent",
 		)
 		val result = providers.exec {
 			commandLine(
@@ -82,7 +90,7 @@ val verifyConsumerApi by tasks.registering {
 			)
 		}
 		val publicApi = result.standardOutput.asText.get()
-		val forbidden = listOf("kotlin.", "kotlinx.", "pocketbaseKotlin")
+		val forbidden = listOf("kotlin.", "kotlinx.", "io.ktor.", "pocketbaseKotlin")
 		check(forbidden.none(publicApi::contains)) {
 			"Consumer API exposes an implementation type:\n$publicApi"
 		}

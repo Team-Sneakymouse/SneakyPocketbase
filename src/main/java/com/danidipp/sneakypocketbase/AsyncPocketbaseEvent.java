@@ -17,6 +17,7 @@ public final class AsyncPocketbaseEvent extends Event {
     private final Action action;
     private final String collectionName;
     private final String recordJson;
+    private final long generation;
 
     public AsyncPocketbaseEvent(
         final boolean async,
@@ -24,11 +25,19 @@ public final class AsyncPocketbaseEvent extends Event {
         final String collectionName,
         final String recordJson
     ) {
+        this(async, action, collectionName, recordJson, -1);
+    }
+
+    public AsyncPocketbaseEvent(boolean async, Action action, String collectionName, String recordJson, long generation) {
         super(async);
         this.action = action;
         this.collectionName = collectionName;
         this.recordJson = recordJson;
+        this.generation = generation;
     }
+
+    /** Connection generation, or -1 for events constructed with the legacy constructor. */
+    public long getGeneration() { return generation; }
 
     public Action getAction() {
         return this.action;

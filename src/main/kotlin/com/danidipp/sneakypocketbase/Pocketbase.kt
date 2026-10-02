@@ -1,427 +1,371 @@
 package com.danidipp.sneakypocketbase
 
-import org.bukkit.Bukkit
+import com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot.*
 import io.github.agrevster.pocketbaseKotlin.PocketbaseClient
-import io.github.agrevster.pocketbaseKotlin.PocketbaseException
-import io.github.agrevster.pocketbaseKotlin.dsl.login
-import io.github.agrevster.pocketbaseKotlin.models.AuthRecord
 import io.github.agrevster.pocketbaseKotlin.models.Record
-import io.github.agrevster.pocketbaseKotlin.services.RealtimeService
 import io.ktor.client.plugins.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.utils.io.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
 import kotlinx.serialization.*
-import kotlinx.serialization.Transient
-import kotlinx.serialization.json.Json
-import java.lang.reflect.Field
+import kotlinx.serialization.json.*
+import org.bukkit.Bukkit
+import java.io.IOException
 import java.util.logging.Logger
+import kotlin.random.Random
 
-class PocketbaseHandler {
-    companion object {
-        private const val MAX_RECONNECT_ATTEMPTS = 5
-        private const val RECONNECT_DELAY_MS = 30_000L
-        private const val LISTENER_START_DELAY_MS = 500L
-        private const val LIFECYCLE_TIMEOUT_MS = 1_000L
+internal class PocketbaseHttpFailure(val code: Int) : IOException("PocketBase HTTP $code")
+
+/** Exception types only: messages and response bodies can contain credentials. */
+internal fun Throwable.failureTypes(): String = generateSequence(this) { it.cause }
+    .take(3).joinToString(" caused by ") { it.javaClass.simpleName.ifEmpty { "Throwable" } }
+
+internal fun Throwable.isAvailabilityFailure(): Boolean = when (this) {
+    is PocketbaseHttpFailure -> code == 401 || code >= 500
+    is ResponseException -> response.status.value == 401 || response.status.value >= 500
+    is IOException, is HttpRequestTimeoutException, is TimeoutCancellationException -> true
+    else -> false
+}
+
+internal class RetryBackoff(private val base: Long = 1_000, private val cap: Long = 60_000,
+                            private val credentialBase: Long = 30_000, private val credentialCap: Long = 300_000) {
+    private var failures = 0
+    fun reset() { failures = 0 }
+    fun nextDelay(rejected: Boolean = false): Long {
+        val floor = if (rejected) maxOf(base, credentialBase) else base
+        val ceiling = if (rejected) maxOf(cap, credentialCap) else cap
+        val delay = (floor * (1L shl failures.coerceAtMost(16))).coerceAtMost(ceiling)
+        failures = (failures + 1).coerceAtMost(16)
+        return Random.nextLong(maxOf(1, delay / 2), delay + 1)
     }
+}
 
-    val pocketbase: PocketbaseClient
-    private var authWait: Deferred<Unit>
-    private val logger: Logger
-    private var realtimeJob: Job? = null
-    private val subscriptionLock = Any()
-    private val realtimeSubscriptions = linkedSetOf<String>()
-    @Volatile
-    var isConnected: Boolean = false
-    @Volatile
-    var isAuthenticated: Boolean = false
-    @Volatile
-    var status = "PreInit"
+/** One replaceable client. Desired subscriptions, revisions and generations live in the coordinator. */
+class PocketbaseHandler internal constructor(
+    private val logger: Logger,
+    pbProtocol: String,
+    pbHost: String,
+    private val pbUser: String,
+    private val pbPassword: String,
+    serverName: String?,
+    private val lifecycle: PocketbaseLifecycle,
+    private val owner: Long,
+    private val scope: CoroutineScope = SneakyPocketbase.asyncScope,
+    private val recordDelivery: (AsyncPocketbaseEvent) -> Unit = { Bukkit.getPluginManager().callEvent(it) },
+    private val backoffFactory: () -> RetryBackoff = { RetryBackoff() },
+    private val subscriptionBackoffFactory: () -> RetryBackoff = { RetryBackoff(5_000, 300_000) },
+) {
+    val pocketbase = PocketbaseClient({ takeFrom("$pbProtocol://$pbHost") })
+    private val authenticated = CompletableDeferred<Unit>()
+    private val recover = Channel<Unit>(Channel.CONFLATED)
+    private val subscriptionsChanged = Channel<Unit>(Channel.CONFLATED)
+    private var supervisor: Job? = null
+    @Volatile private var stopped = false
+    @Volatile private var token = ""
+    private var lastFailureLog = 0L
 
-    @OptIn(DelicateCoroutinesApi::class)
-    constructor(logger: Logger,
-                pbProtocol: String,
-                pbHost: String,
-                pbUser: String,
-                pbPassword: String,
-                serverName: String? = null) {
-        this.logger = logger
-        status = "Initializing"
-        pocketbase = PocketbaseClient({
-            this.protocol = URLProtocol.byName[pbProtocol]!!
-            this.host = pbHost
-        })
+    val isConnected: Boolean get() = lifecycle.owns(owner) && lifecycle.snapshot().transportState == TransportState.CONNECTED
+    val isAuthenticated: Boolean get() = lifecycle.owns(owner) && lifecycle.snapshot().apiState == ApiState.AVAILABLE
+    val status: String get() = lifecycle.snapshot().let { "${it.apiState}/${it.transportState}" }
+
+    init {
+        // Covers requests from the Java adapter and internal record consumers alike.
         pocketbase.httpClient.plugin(HttpSend).intercept { request ->
-            request.headers.append("User-Agent", "SneakyPocketbase" + (serverName?.let { "/$it" } ?: ""))
-            execute(request)
-        }
-
-        status = "Authenticating"
-        authWait = SneakyPocketbase.asyncScope.async {
-            val token = pocketbase.records.authWithPassword<AuthRecord>("_superusers", pbUser, pbPassword).token
-            pocketbase.login { this.token = token }
-            isAuthenticated = true
-        }
-        logger.fine("Registering pre-init loaded callbacks")
-        for (callback in SneakyPocketbase.drainPreInitLoadedCallbacks()) {
-            onLoaded(callback)
-        }
-        status = "Initialized"
-    }
-
-    fun onLoaded(callback: java.lang.Runnable) {
-        authWait.invokeOnCompletion { cause ->
-            // cause can be null (normal completion), CancellationException (cancelled), or a general error
-            if (cause == null) {
-                scheduleLoadedCallback(callback)
+            val generation = lifecycle.snapshot().generation
+            val managedRequest = request.url.encodedPath == "/api/realtime" ||
+                request.url.encodedPath.startsWith("/api/collections/_superusers/auth-")
+            request.headers.remove(HttpHeaders.UserAgent)
+            request.headers.append(HttpHeaders.UserAgent, "SneakyPocketbase" + (serverName?.let { "/$it" } ?: ""))
+            if (token.isNotEmpty()) {
+                request.headers.remove(HttpHeaders.Authorization)
+                request.headers.append(HttpHeaders.Authorization, token)
+            }
+            try {
+                val call = execute(request)
+                val code = call.response.status.value
+                if (!managedRequest && (code == 401 || code >= 500)) requestFailed(generation, PocketbaseHttpFailure(code))
+                call
+            } catch (failure: Exception) {
+                if (!managedRequest && failure.isAvailabilityFailure()) requestFailed(generation, failure)
+                throw failure
             }
         }
     }
 
-    private fun scheduleLoadedCallback(callback: java.lang.Runnable) {
-        val scope = SneakyPocketbase.pocketbaseLoadedCallbackScopeOrNull()
-        if (scope == null) {
-            logger.fine("Skipping Pocketbase loaded callback because callback execution is stopped")
-            return
-        }
-
-        scope.launch(CoroutineName("PocketbaseLoadedCallback")) {
-            if (SneakyPocketbase.pocketbaseLoadedCallbackScopeOrNull() == null) {
-                logger.fine("Skipping Pocketbase loaded callback because callback execution stopped before execution")
-                return@launch
-            }
-
-            runCatching {
-                callback.run()
-            }.onFailure {
-                if (it !is CancellationException) {
-                    logger.warning("Pocketbase loaded callback failed")
-                    logger.fine(it.stackTraceToString())
+    fun onLoaded(callback: Runnable) {
+        authenticated.invokeOnCompletion { failure ->
+            if (failure == null && !stopped) scope.launch {
+                if (!stopped && lifecycle.owns(owner)) {
+                    try { callback.run() } catch (error: Exception) { logger.warning("PocketBase authentication callback failed") }
                 }
             }
         }
     }
 
-    suspend fun subscribe(subscriptionName: String) {
-        val shouldApply = synchronized(subscriptionLock) {
-            realtimeSubscriptions.add(subscriptionName)
-            isConnected
-        }
-        logger.info("Registered Pocketbase Realtime subscription '$subscriptionName'")
-        if (shouldApply) {
-            applyRealtimeSubscriptions("subscription update")
-        }
-    }
+    internal fun subscriptionsChanged() { subscriptionsChanged.trySend(Unit) }
 
-    suspend fun unsubscribe(subscriptionName: String) {
-        val shouldApply = synchronized(subscriptionLock) {
-            realtimeSubscriptions.remove(subscriptionName)
-            isConnected
-        }
-        logger.info("Removed Pocketbase Realtime subscription '$subscriptionName'")
-        if (shouldApply) {
-            runCatching {
-                pocketbase.realtime.unsubscribe(subscriptionName)
-            }.onFailure {
-                if (it !is CancellationException) {
-                    logger.warning("Failed to send Pocketbase Realtime unsubscribe for '$subscriptionName'")
-                    logger.fine(it.stackTraceToString())
-                }
-            }
-        }
+    fun runRealtime() {
+        if (supervisor?.isActive == true || stopped) return
+        supervisor = scope.launch(CoroutineName("PocketbaseRecovery")) { supervise() }
     }
 
     fun stop() {
-        status = "Stopping"
-        runBlocking {
-            val currentRealtimeJob = realtimeJob
-            realtimeJob = null
-            cancelAndJoinSafely(currentRealtimeJob, "Pocketbase Realtime supervisor")
-            cancelAndJoinSafely(authWait, "Pocketbase authentication job")
-
-            logger.info("Disconnecting from Pocketbase Realtime")
-            disconnectRealtime("Failed to disconnect from Pocketbase Realtime cleanly")
-            markDisconnected()
-        }
-        status = "Stopped"
+        stopped = true
+        supervisor?.cancel()
+        authenticated.cancel()
+        pocketbase.httpClient.close()
+        runBlocking { withTimeoutOrNull(1_000) { supervisor?.join() } }
     }
 
-    fun runRealtime() {
-        logger.info("Starting Pocketbase Realtime")
-        status = "Starting Realtime"
-        runBlocking {
-            val currentRealtimeJob = realtimeJob
-            realtimeJob = null
-            cancelAndJoinSafely(currentRealtimeJob, "Pocketbase Realtime supervisor")
-            disconnectRealtime()
+    internal fun requestFailed(generation: Long, failure: Throwable) {
+        if (stopped || !failure.isAvailabilityFailure()) return
+        val authenticationRejected = when (failure) {
+            is PocketbaseHttpFailure -> failure.code == 401
+            is ResponseException -> failure.response.status.value == 401
+            else -> false
         }
-        realtimeJob = SneakyPocketbase.asyncScope.launch outer@{
-            if (!awaitAuthentication()) return@outer
-            runRealtimeLoop()
+        if (lifecycle.update(owner, generation,
+                api = if (authenticationRejected) ApiState.AUTHENTICATION_FAILED else ApiState.UNAVAILABLE,
+                transport = TransportState.DISCONNECTED, resetCollections = true,
+                reason = if (authenticationRejected) "authentication rejected" else "API transport failure")) {
+            if (authenticationRejected) token = ""
+            recover.trySend(Unit)
         }
     }
 
-    private suspend fun awaitAuthentication(): Boolean {
-        val result = runCatching {
-            status = "Waiting for authentication"
-            authWait.await()
-            status = "Authenticated"
-            true
-        }
-
-        val failure = result.exceptionOrNull()
-        if (failure == null) return true
-
-        if (failure is CancellationException || !currentCoroutineContext().isActive) return false
-
-        status = "Authentication failed"
-        logger.severe("Failed to authenticate with Pocketbase")
-        logger.severe(failure.stackTraceToString())
-        return false
-    }
-
-    private suspend fun runRealtimeLoop() {
-        var startupFailures = 0
-        var hasEstablishedConnection = false
-
-        while (currentCoroutineContext().isActive && SneakyPocketbase.asyncScope.isActive) {
-            logger.info("Connecting to Pocketbase Realtime")
-            status = "Connecting"
-
-            val result = runRealtimeSession(hasEstablishedConnection)
-            markDisconnected()
-
-            if (!currentCoroutineContext().isActive || !SneakyPocketbase.asyncScope.isActive) {
-                return
+    private suspend fun supervise() {
+        val backoff = backoffFactory()
+        while (currentCoroutineContext().isActive && lifecycle.owns(owner)) {
+            while (recover.tryReceive().isSuccess) { }
+            val startedAt = System.nanoTime()
+            val failure = try {
+                if (lifecycle.snapshot().apiState != ApiState.AVAILABLE) authenticateOrProbe()
+                runSession()
+                null
+            } catch (error: CancellationException) {
+                if (!currentCoroutineContext().isActive) throw error
+                error
+            } catch (error: Exception) { error }
+            if (!lifecycle.owns(owner)) return
+            if (System.nanoTime() - startedAt >= 60_000_000_000L) backoff.reset()
+            if (failure is PocketbaseHttpFailure && failure.code == 401) token = ""
+            val rejected = failure is PocketbaseHttpFailure && failure.code in listOf(400, 401, 403) && token.isEmpty()
+            lifecycle.update(owner,
+                api = when {
+                    rejected -> ApiState.AUTHENTICATION_FAILED
+                    failure?.isAvailabilityFailure() == true -> ApiState.UNAVAILABLE
+                    else -> null
+                },
+                transport = TransportState.DISCONNECTED, resetCollections = true,
+                reason = when { rejected -> "credentials rejected"; failure != null -> "connection failed"; else -> "realtime disconnected" })
+            if (failure != null && (lastFailureLog == 0L || System.nanoTime() - lastFailureLog > 300_000_000_000L)) {
+                val summary = if (rejected) "PocketBase credentials rejected" else "PocketBase connection failed"
+                logger.warning("$summary (${failure.failureTypes()}); retrying with backoff")
+                lastFailureLog = System.nanoTime()
             }
+            delay(backoff.nextDelay(rejected))
+        }
+    }
 
-            if (result.established) {
-                hasEstablishedConnection = true
-                startupFailures = 0
-            } else if (!hasEstablishedConnection) {
-                startupFailures++
-                if (startupFailures >= MAX_RECONNECT_ATTEMPTS) {
-                    status = "Realtime startup failed"
-                    logger.severe("Failed to connect to Pocketbase Realtime after $MAX_RECONNECT_ATTEMPTS tries")
-                    result.failure?.let { logger.severe(it.stackTraceToString()) }
-                    return
+    private suspend fun authenticateOrProbe() {
+        val generation = lifecycle.snapshot().generation
+        if (token.isNotEmpty()) {
+            try {
+                withTimeout(30_000) {
+                    val response = pocketbase.httpClient.post("/api/collections/_superusers/auth-refresh").requireSuccess().bodyAsText()
+                    if (!lifecycle.owns(owner) || lifecycle.snapshot().generation != generation) throw IOException("Recovery probe superseded")
+                    token = Json.parseToJsonElement(response).jsonObject.getValue("token").jsonPrimitive.content
                 }
+            } catch (failure: PocketbaseHttpFailure) {
+                if (failure.code !in listOf(400, 401, 403)) throw failure
+                lifecycle.update(owner, generation, api = ApiState.AUTHENTICATION_FAILED, reason = "authentication refresh rejected")
+                token = ""
             }
-
-            logReconnect(result.failure, if (hasEstablishedConnection) null else MAX_RECONNECT_ATTEMPTS - startupFailures)
-            status = "Waiting to reconnect"
-            delay(RECONNECT_DELAY_MS)
         }
+        if (token.isEmpty()) {
+            lifecycle.update(owner, api = ApiState.AUTHENTICATING, reason = "authenticating")
+            val response = withTimeout(30_000) {
+                pocketbase.httpClient.post("/api/collections/_superusers/auth-with-password") {
+                    contentType(ContentType.Application.Json)
+                    setBody(buildJsonObject { put("identity", pbUser); put("password", pbPassword) }.toString())
+                }.requireSuccess().bodyAsText()
+            }
+            val newToken = Json.parseToJsonElement(response).jsonObject.getValue("token").jsonPrimitive.content
+            if (!lifecycle.owns(owner) || lifecycle.snapshot().generation != generation) throw IOException("Authentication attempt superseded")
+            token = newToken
+        }
+        if (!lifecycle.update(owner, generation, api = ApiState.AVAILABLE, reason = "authenticated")) throw IOException("Recovery probe superseded")
+        authenticated.complete(Unit)
     }
 
-    private suspend fun runRealtimeSession(hasConnectedBefore: Boolean): RealtimeSessionResult = coroutineScope {
-        disconnectRealtime()
-
-        val sessionEstablished = CompletableDeferred<Unit>()
-        val sessionEnded = CompletableDeferred<Throwable?>()
-        var announcedConnected = false
-
-        val connectJob = launch(CoroutineName("PocketbaseRealtimeConnect")) {
-            runCatching {
-                pocketbase.realtime.connect()
-            }.onSuccess {
-                if (!sessionEnded.isCompleted) sessionEnded.complete(null)
-            }.onFailure {
-                if (it !is CancellationException && !sessionEnded.isCompleted) sessionEnded.complete(it)
-            }
-        }
-
-        val listenerJob = launch(CoroutineName("PocketbaseRealtimeListen")) {
-            delay(LISTENER_START_DELAY_MS)
-            runCatching {
-                pocketbase.realtime.listen {
-                    if (action == RealtimeService.RealtimeActionType.CONNECT) {
-                        if (!sessionEstablished.isCompleted)
-                            sessionEstablished.complete(Unit)
-                        isConnected = true
-                        status = "Connected"
-                        if (!announcedConnected) {
-                            announcedConnected = true
-                            logger.info(if (hasConnectedBefore) "Reconnected to Pocketbase Realtime" else "Connected to Pocketbase Realtime")
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun runSession() = coroutineScope {
+        val generation = lifecycle.attempt(owner) ?: return@coroutineScope
+        val connected = CompletableDeferred<String>()
+        val stream = async(CoroutineName("PocketbaseRealtimeStream")) {
+            try {
+                pocketbase.httpClient.prepareGet("/api/realtime") {
+                    header(HttpHeaders.Accept, "text/event-stream")
+                    // SSE lasts for the whole session; readSse still bounds idle reads.
+                    timeout { requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS }
+                }.execute { response ->
+                    response.requireSuccess()
+                    readSse(response.bodyAsChannel()) { event, data ->
+                        if (!lifecycle.owns(owner)) return@readSse
+                        if (event == "PB_CONNECT") {
+                            val id = Json.parseToJsonElement(data).jsonObject.getValue("clientId").jsonPrimitive.content
+                            if (lifecycle.update(owner, generation, transport = TransportState.CONNECTED, reason = "realtime connected")) {
+                                connected.complete(id)
+                            }
+                        } else if (connected.isCompleted) {
+                            val payload = Json.parseToJsonElement(data).jsonObject
+                            val action = payload["action"]?.jsonPrimitive?.content ?: return@readSse
+                            val record = payload["record"]?.jsonObject ?: return@readSse
+                            val name = record["collectionName"]?.jsonPrimitive?.content ?: ""
+                            val snapshot = lifecycle.snapshot()
+                            if (snapshot.isCollectionReady(name)) {
+                                try {
+                                    recordDelivery(AsyncPocketbaseEvent(true, AsyncPocketbaseEvent.Action.valueOf(action.uppercase()), name, record.toString(), snapshot.generation))
+                                } catch (failure: Exception) {
+                                    logger.warning("PocketBase record listener failed: ${failure.javaClass.simpleName}")
+                                }
+                            }
                         }
-                        launch(CoroutineName("PocketbaseRealtimeSubscribe")) {
-                            applyRealtimeSubscriptions("connection established")
-                        }
-                        return@listen
                     }
-
-                    val record = this.parseRecord<BaseRecord>(Json { ignoreUnknownKeys = true })
-                    val collectionName = record.collectionName ?: ""
-                    logger.fine("Received Pocketbase Realtime event on ${collectionName}: $action, ${record.id}")
-                    Bukkit.getScheduler().runTaskAsynchronously(SneakyPocketbase.getInstance(), Runnable {
-                        Bukkit.getPluginManager().callEvent(
-                            AsyncPocketbaseEvent(
-                                true,
-                                AsyncPocketbaseEvent.Action.valueOf(action.name),
-                                collectionName,
-                                this.record.toString(),
-                            )
-                        )
-                    })
                 }
-            }.onSuccess {
-                if (!sessionEnded.isCompleted) {
-                    sessionEnded.complete(null)
-                }
-            }.onFailure {
-                if (it !is CancellationException && !sessionEnded.isCompleted) {
-                    sessionEnded.complete(it)
-                }
+            } catch (failure: Exception) {
+                // Publish loss before waiting for sibling subscription requests to be cancelled.
+                if (failure.isAvailabilityFailure()) requestFailed(lifecycle.snapshot().generation, failure)
+                throw failure
+            } finally {
+                lifecycle.update(owner, transport = TransportState.DISCONNECTED, resetCollections = true, reason = "realtime disconnected")
             }
         }
-
-        val failure = try {
-            sessionEnded.await()
-        } finally {
-            withContext(NonCancellable) {
-                disconnectRealtime()
-                cancelAndJoinSafely(listenerJob, "Pocketbase Realtime listener")
-                cancelAndJoinSafely(connectJob, "Pocketbase Realtime connector")
-            }
-        }
-
-        RealtimeSessionResult(
-            established = sessionEstablished.isCompleted,
-            failure = failure,
-        )
-    }
-
-    private suspend fun disconnectRealtime(warningMessage: String? = null) {
-        var timedOut = false
-        val failure = runCatching {
-            val disconnectJob = SneakyPocketbase.asyncScope.async(CoroutineName("PocketbaseRealtimeDisconnect")) {
-                pocketbase.realtime.disconnect()
-            }
-            val completed = withTimeoutOrNull(LIFECYCLE_TIMEOUT_MS) {
-                disconnectJob.await()
-                true
-            } ?: false
-            if (!completed) {
-                timedOut = true
-                disconnectJob.cancel()
-            }
-        }.exceptionOrNull()
-
-        if (timedOut) {
-            val message = warningMessage ?: "Timed out while disconnecting from Pocketbase Realtime"
-            logger.warning("$message after ${LIFECYCLE_TIMEOUT_MS}ms")
-            markDisconnected()
-            forceResetRealtimeState()
-            return
-        }
-
-        if (failure != null && failure !is CancellationException) {
-            if (warningMessage != null) {
-                logger.warning(warningMessage)
-                logger.fine(failure.stackTraceToString())
-            }
-            markDisconnected()
-            forceResetRealtimeState()
-        }
-    }
-
-    private suspend fun applyRealtimeSubscriptions(reason: String) {
-        val subscriptions = synchronized(subscriptionLock) {
-            realtimeSubscriptions.toList()
-        }
-        if (subscriptions.isEmpty()) {
-            logger.info("No Pocketbase Realtime subscriptions to apply after $reason")
-            return
-        }
-
+        var applier: Job? = null
         try {
-            pocketbase.realtime.subscribe(2_000L, *subscriptions.toTypedArray())
-            logger.info("Applied Pocketbase Realtime subscriptions after $reason: ${subscriptions.joinToString(", ")}")
-        } catch (it: CancellationException) {
-            throw it
-        } catch (it: Exception) {
-            if (currentCoroutineContext().isActive) {
-                logger.warning("Failed to apply Pocketbase Realtime subscriptions after $reason: ${subscriptions.joinToString(", ")}")
-                logger.fine(it.stackTraceToString())
+            val id = select<String?> {
+                connected.onAwait { it }
+                stream.onAwait { null }
+                recover.onReceive { null }
+                onTimeout(30_000) { throw IOException("Realtime connection timed out") }
+            } ?: return@coroutineScope
+            applier = launch(CoroutineName("PocketbaseSubscriptions")) { applySubscriptions(id) }
+            select<Unit> {
+                stream.onAwait { }
+                applier.onJoin { }
+                recover.onReceive { }
+            }
+        } finally {
+            applier?.cancel()
+            stream.cancel()
+        }
+    }
+
+    private suspend fun applySubscriptions(clientId: String) {
+        val accepted = linkedSetOf<String>()
+        val retryAt = mutableMapOf<String, Long>()
+        val retries = mutableMapOf<String, RetryBackoff>()
+        while (currentCoroutineContext().isActive && lifecycle.owns(owner)) {
+            val desired = lifecycle.snapshot().collections.keys
+            retryAt.keys.retainAll(desired)
+            retries.keys.retainAll(desired)
+            if (!desired.containsAll(accepted)) {
+                val remaining = accepted.intersect(desired)
+                setSubscriptions(clientId, remaining)
+                accepted.retainAll(desired)
+            }
+            for (name in desired - accepted) {
+                if ((retryAt[name] ?: 0) > System.nanoTime()) continue
+                val generation = lifecycle.snapshot().generation
+                try {
+                    withTimeout(30_000) {
+                        pocketbase.httpClient.get("/api/collections/${name.encodeURLPathPart()}/records") { parameter("perPage", 1) }.requireSuccess()
+                        setSubscriptions(clientId, accepted + name)
+                    }
+                    // Track what the server accepted even if intent changed during the request,
+                    // so the next pass can remove a concurrently unregistered topic.
+                    accepted.add(name)
+                    if (lifecycle.collection(owner, generation, name, SubscriptionState.READY, "subscription accepted")) {
+                        retryAt.remove(name)
+                        retries.remove(name)
+                    } else {
+                        accepted.remove(name)
+                        // Force the server set back to the known current registrations before retrying.
+                        setSubscriptions(clientId, accepted.intersect(lifecycle.snapshot().collections.keys))
+                        subscriptionsChanged.trySend(Unit)
+                    }
+                } catch (failure: CancellationException) {
+                    if (!currentCoroutineContext().isActive) throw failure
+                    val timeout = IOException("Subscription request timed out", failure)
+                    requestFailed(lifecycle.snapshot().generation, timeout)
+                    throw timeout
+                } catch (failure: Exception) {
+                    if (failure.isAvailabilityFailure()) {
+                        requestFailed(lifecycle.snapshot().generation, failure)
+                        throw failure
+                    }
+                    val reason = if (failure is PocketbaseHttpFailure) "subscription rejected (HTTP ${failure.code})" else "subscription application failed"
+                    lifecycle.collection(owner, generation, name, SubscriptionState.FAILED, reason)
+                    retryAt[name] = System.nanoTime() + retries.getOrPut(name, subscriptionBackoffFactory).nextDelay() * 1_000_000
+                }
+            }
+            val waitMillis = retryAt.values.minOrNull()?.let { ((it - System.nanoTime()) / 1_000_000).coerceAtLeast(1) }
+            if (waitMillis == null) subscriptionsChanged.receive()
+            else withTimeoutOrNull(waitMillis) { subscriptionsChanged.receive() }
+        }
+    }
+
+    private suspend fun setSubscriptions(clientId: String, names: Set<String>) {
+        val response = withTimeout(30_000) {
+            pocketbase.httpClient.post("/api/realtime") {
+                contentType(ContentType.Application.Json)
+                setBody(buildJsonObject {
+                    put("clientId", clientId)
+                    putJsonArray("subscriptions") { names.forEach { add("$it/*") } }
+                }.toString())
             }
         }
+        // 403 here means the client's authorization changed; 404 means the SSE client expired.
+        if (response.status.value == 403) {
+            requestFailed(lifecycle.snapshot().generation, PocketbaseHttpFailure(401))
+            throw PocketbaseHttpFailure(401)
+        }
+        if (response.status.value == 404) throw IOException("Realtime client expired")
+        response.requireSuccess()
     }
+}
 
-    private suspend fun forceResetRealtimeState() {
-        runCatching {
-            val realtime = pocketbase.realtime
-            val realtimeClass = realtime.javaClass
+internal fun HttpResponse.requireSuccess(): HttpResponse {
+    if (!status.isSuccess()) throw PocketbaseHttpFailure(status.value)
+    return this
+}
 
-            getMutableField<MutableSet<Job>>(realtimeClass, realtime, "sseCoroutines")?.toList()?.forEach { job ->
-                cancelAndJoinSafely(job, "Pocketbase Realtime SSE job")
-            }
-            getMutableField<MutableSet<*>>(realtimeClass, realtime, "sseCoroutines")?.clear()
-            getMutableField<MutableSet<*>>(realtimeClass, realtime, "subscriptions")?.clear()
-
-            setFieldValue(realtimeClass, realtime, "clientId", null)
-            setFieldValue(realtimeClass, realtime, "connected", false)
-            logger.warning("Forced Pocketbase Realtime state reset after disconnect failure")
-        }.onFailure {
-            logger.severe("Failed to force-reset Pocketbase Realtime state")
-            logger.severe(it.stackTraceToString())
+/** Parse SSE framing, including comments and multiline data. Bound idle reads for half-open sockets. */
+internal suspend fun readSse(channel: ByteReadChannel, consume: suspend (String, String) -> Unit) {
+    var event = "message"
+    val data = mutableListOf<String>()
+    while (true) {
+        val line = withTimeout(360_000) { channel.readUTF8Line() } ?: return
+        if (line.isEmpty()) {
+            if (data.isNotEmpty()) consume(event, data.joinToString("\n"))
+            event = "message"
+            data.clear()
+        } else if (!line.startsWith(":")) {
+            val field = line.substringBefore(':')
+            val value = line.substringAfter(':', "").removePrefix(" ")
+            when (field) { "event" -> event = value; "data" -> data.add(value) }
         }
     }
-
-    private fun setFieldValue(clazz: Class<*>, instance: Any, fieldName: String, value: Any?) {
-        val field = clazz.getDeclaredField(fieldName)
-        field.isAccessible = true
-        field.set(instance, value)
-    }
-
-    private fun <T> getMutableField(clazz: Class<*>, instance: Any, fieldName: String): T? {
-        val field: Field = clazz.getDeclaredField(fieldName)
-        field.isAccessible = true
-        @Suppress("UNCHECKED_CAST")
-        return field.get(instance) as? T
-    }
-
-    private suspend fun cancelAndJoinSafely(job: Job?, description: String) {
-        if (job == null) return
-        job.cancel()
-        val joined = withTimeoutOrNull(LIFECYCLE_TIMEOUT_MS) {
-            job.join()
-            true
-        } ?: false
-        if (!joined) {
-            logger.warning("Timed out while waiting for $description to stop")
-        }
-    }
-
-    private fun markDisconnected() {
-        isConnected = false
-        status = "Disconnected"
-    }
-
-    private fun logReconnect(failure: Throwable?, remainingAttempts: Int?) {
-        if (failure != null) {
-            if (failure is PocketbaseException && failure.reason.contains("already connected", true)) {
-                logger.warning("Pocketbase Realtime reported a stale connection while reconnecting")
-            } else {
-                logger.warning("Pocketbase Realtime session ended")
-            }
-            logger.fine(failure.stackTraceToString())
-        }
-
-        if (remainingAttempts == null) {
-            logger.warning("Disconnected from Pocketbase Realtime. Reconnecting in 30 seconds...")
-            return
-        }
-
-        logger.warning("Disconnected from Pocketbase Realtime. $remainingAttempts remaining. Reconnecting in 30 seconds...")
-    }
-
-    private data class RealtimeSessionResult(
-        val established: Boolean,
-        val failure: Throwable?,
-    )
 }
 
 @Serializable
-open class BaseRecord(@Transient open val recordId: String? = null): Record(recordId){
+open class BaseRecord(@Transient open val recordId: String? = null): Record(recordId) {
     fun <T: BaseRecord> toJson(serializer: KSerializer<T>): String {
         @Suppress("UNCHECKED_CAST")
         return Json.encodeToString(serializer, this as T)

@@ -7,12 +7,20 @@ import kotlinx.coroutines.*
 
 class SneakyPocketbase : JavaPlugin() {
     internal lateinit var pbHandler: PocketbaseHandler
+    internal val lifecycle = PocketbaseLifecycle(
+        deliver = { previous, current -> Bukkit.getPluginManager().callEvent(AsyncPocketbaseLifecycleEvent(previous, current)) },
+        deliveryFailed = { logger.warning("PocketBase lifecycle listener failed: ${it.javaClass.simpleName}") },
+    )
     private val consumerApi: PocketbaseApi = PocketbaseApiAdapter(
         scope = { asyncScope },
         client = { pb() },
         ready = { onPocketbaseLoaded(it) },
         subscribeAction = { subscribe(it) },
         unsubscribeAction = { unsubscribe(it) },
+        lifecycle = { lifecycle.snapshot() },
+        operationFailed = { generation, failure ->
+            if (::pbHandler.isInitialized) pbHandler.requestFailed(generation, failure)
+        },
     )
 
     fun hasPocketbaseHandler(): Boolean {
@@ -57,11 +65,8 @@ class SneakyPocketbase : JavaPlugin() {
         }
     }
     internal suspend fun subscribe(subscriptionName: String) {
-        if (::pbHandler.isInitialized) {
-            pbHandler.subscribe(subscriptionName)
-        } else {
-            throw IllegalStateException("Pocketbase not loaded yet")
-        }
+        lifecycle.register(subscriptionName)
+        if (::pbHandler.isInitialized) pbHandler.subscriptionsChanged()
     }
     fun unsubscribeAsync(subscriptionName: String) {
         asyncScope.launch {
@@ -74,11 +79,8 @@ class SneakyPocketbase : JavaPlugin() {
         }
     }
     internal suspend fun unsubscribe(subscriptionName: String) {
-        if (::pbHandler.isInitialized) {
-            pbHandler.unsubscribe(subscriptionName)
-        } else {
-            throw IllegalStateException("Pocketbase not loaded yet")
-        }
+        lifecycle.unregister(subscriptionName)
+        if (::pbHandler.isInitialized) pbHandler.subscriptionsChanged()
     }
 
     override fun onLoad() {
@@ -100,6 +102,7 @@ class SneakyPocketbase : JavaPlugin() {
             return
         }
         loadConfig()
+        lifecycle.startDelivery()
         Bukkit.getServer().commandMap.registerAll(IDENTIFIER, listOf(
             ReloadCommand(),
             StatusCommand(),
@@ -128,20 +131,21 @@ class SneakyPocketbase : JavaPlugin() {
 
     fun restartPocketbase(): Boolean {
         val settings = readPocketbaseSettings() ?: return false
+        val owner = lifecycle.beginHandler()
 
         if (::pbHandler.isInitialized) {
             logger.info("Restarting Pocketbase")
             pbHandler.stop()
         }
 
-        pbHandler = createPocketbaseHandler(settings)
+        pbHandler = createPocketbaseHandler(settings, owner)
         pbHandler.runRealtime()
         return true
     }
 
     private fun initializePocketbase(): Boolean {
         val settings = readPocketbaseSettings() ?: return false
-        pbHandler = createPocketbaseHandler(settings)
+        pbHandler = createPocketbaseHandler(settings, lifecycle.beginHandler())
         return true
     }
 
@@ -160,19 +164,23 @@ class SneakyPocketbase : JavaPlugin() {
         return PocketbaseSettings(pbProtocol, pbHost, pbUser, pbPassword, serverName)
     }
 
-    private fun createPocketbaseHandler(settings: PocketbaseSettings): PocketbaseHandler {
-        return PocketbaseHandler(
+    private fun createPocketbaseHandler(settings: PocketbaseSettings, owner: Long): PocketbaseHandler {
+        val handler = PocketbaseHandler(
             logger,
             settings.protocol,
             settings.host,
             settings.user,
             settings.password,
             settings.serverName,
+            lifecycle,
+            owner,
         )
+        drainPreInitLoadedCallbacks().forEach(handler::onLoaded)
+        return handler
     }
 
     override fun onDisable() {
-        PocketbaseProvider.clear()
+        lifecycle.stop()
         stopPocketbaseLoadedCallbacks()
         logger.info("Disabling SneakyPocketbase")
         MSVariableSync.stopSync()
@@ -183,6 +191,8 @@ class SneakyPocketbase : JavaPlugin() {
         }
 
         shutdownAsyncScope()
+        lifecycle.finishDelivery()
+        PocketbaseProvider.clear()
     }
 
     companion object {
