@@ -134,9 +134,11 @@ Compile against the same SneakyPocketbase artifact that will be deployed:
 
 ```kotlin
 dependencies {
-    compileOnly(files("../SneakyPocketbase/build/libs/SneakyPocketbase-1.0-api.jar"))
+    compileOnly("io.github.team-sneakymouse:sneakypocketbase-api:1.0")
 }
 ```
+
+Add the Maven repository URL hosting that release to your consumer's `repositories` block, and declare the supported Paper API as `compileOnly` as well. Do not shade or bundle SneakyPocketbase API classes into consumers; the server plugin supplies them through the joined classpath.
 
 Consumers may choose their own internal Kotlin packaging strategy. Compatibility at the SneakyPocketbase seam depends on keeping Kotlin and PocketBase implementation types out of method parameters, return values, callbacks, events, and shared model inheritance—not on sharing a Kotlin runtime between plugin classloaders.
 
@@ -151,3 +153,30 @@ Deploy `SneakyPocketbase-1.0.jar` on the server. The `-api.jar` is compile-time 
 ```
 
 If a linkage error mentions different class objects for `Function2`, `Continuation`, `CoroutineScope`, or another Kotlin type, search the consumer for calls that bypass `PocketbaseApi` or event/model types that expose an implementation dependency.
+
+## Maven publication
+
+The `consumerApi` publication publishes `io.github.team-sneakymouse:sneakypocketbase-api` using the project version, with API sources and Javadocs. It deliberately excludes plugin implementation dependencies. Install the full shaded plugin JAR separately on the server.
+
+For a repository using username/password authentication, put these properties in your user-level Gradle configuration (`%USERPROFILE%\.gradle\gradle.properties` on Windows), outside this project:
+
+```properties
+sneakyrpUsername=YOUR_UPLOAD_USERNAME
+sneakyrpPassword=YOUR_UPLOAD_TOKEN
+```
+
+Publishing targets `https://maven.sneakyrp.com/releases`. For Reposilite, `sneakyrpUsername` is the token name (the name used when generating it), and `sneakyrpPassword` is its generated secret. The build uses HTTP Basic authentication. Never commit the token or pass it on the command line.
+
+Once configured, publish with:
+
+```powershell
+./gradlew publishConsumerApiPublicationToSneakyrpRepository
+```
+
+Publication runs `check` first.
+
+GitHub Actions builds and publishes the API on every push to `main`, using `version` from `gradle.properties`. The workflow builds with Java 25, then fetches `MAVEN_USERNAME` and `MAVEN_PASSWORD` from `/Maven` in the Infisical `lords-of-minecraft` project, `prod` environment, using the same OIDC setup as OverlayV1. Make `INFISICAL_IDENTITY_ID` and `INFISICAL_DOMAIN` available as GitHub Actions secrets for this repository, and ensure the identity's OIDC policy allows this repository's `main` branch and access to `/Maven`.
+
+MagicSpells is resolved as the compile-only dependency `io.github.team-sneakymouse:magicspells-core:4.0-Beta-18` from Maven Central, matching MagicSpells-Workspace's current published version. No local MagicSpells JAR is required.
+
+Released versions must not be overwritten. Keep `version` in `gradle.properties` and the server plugin version in `paper-plugin.yml` aligned when making a release.
