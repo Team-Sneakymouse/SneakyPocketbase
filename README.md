@@ -177,6 +177,6 @@ Publication runs `check` first.
 
 GitHub Actions builds and publishes the API on every push to `main`, using the version derived from the checked-out Git commit. The workflow builds with Java 25, then fetches `MAVEN_USERNAME` and `MAVEN_PASSWORD` from `/Maven` in the Infisical `lords-of-minecraft` project, `prod` environment, using the same OIDC setup as OverlayV1. Make `INFISICAL_IDENTITY_ID` and `INFISICAL_DOMAIN` available as GitHub Actions secrets for this repository, and ensure the identity's OIDC policy allows this repository's `main` branch and access to `/Maven`.
 
-MagicSpells is resolved as the compile-only dependency `io.github.team-sneakymouse:magicspells-core:4.0-Beta-18` from Maven Central, matching MagicSpells-Workspace's current published version. No local MagicSpells JAR is required.
+MagicSpells is resolved as the compile-only dependency `io.github.team-sneakymouse:magicspells-core:2026.10.09-17f579714ffe` from `https://maven.sneakyrp.com/releases`. No local MagicSpells JAR is required.
 
 Versions use `yyyy.MM.dd-<12-character Git hash>`, with the date taken from the commit timestamp in UTC. Gradle derives this automatically for local builds and CI, and inserts the same version into `paper-plugin.yml`. Each new commit gets its own version; rebuilding the same commit reuses its version. Uncommitted edits keep the current HEAD version, so commit changes before publishing. Builds require a Git checkout.

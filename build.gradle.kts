@@ -30,13 +30,14 @@ repositories {
 		name = "papermc"
 		url = uri("https://repo.papermc.io/repository/maven-public/")
 	}
+	maven("https://maven.sneakyrp.com/releases")
 }
 
 dependencies {
 	implementation(kotlin("stdlib"))
 	compileOnly("io.papermc.paper:paper-api:26.2.build.117-stable")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
-	compileOnly("io.github.team-sneakymouse:magicspells-core:4.0-Beta-18") {
+	compileOnly("io.github.team-sneakymouse:magicspells-core:2026.10.09-17f579714ffe") {
 		isTransitive = false
 	}
 	testImplementation(kotlin("test-junit5"))
