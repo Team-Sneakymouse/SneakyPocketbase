@@ -134,7 +134,7 @@ Compile against the same SneakyPocketbase artifact that will be deployed:
 
 ```kotlin
 dependencies {
-    compileOnly("io.github.team-sneakymouse:sneakypocketbase-api:1.0")
+    compileOnly("io.github.team-sneakymouse:sneakypocketbase-api:<date-hash>")
 }
 ```
 
@@ -144,7 +144,7 @@ Consumers may choose their own internal Kotlin packaging strategy. Compatibility
 
 ## Interface verification
 
-Deploy `SneakyPocketbase-1.0.jar` on the server. The `-api.jar` is compile-time only and deliberately contains no Kotlin runtime or implementation classes.
+Deploy `SneakyPocketbase-<date-hash>.jar` on the server. The `-api.jar` is compile-time only and deliberately contains no Kotlin runtime or implementation classes. Replace `<date-hash>` with the published version you compile against.
 
 `verifyConsumerApi` inspects the compiled Java interface with `javap` and fails if Kotlin, kotlinx, or PocketBase Kotlin implementation types appear. It runs automatically as part of `check`:
 
@@ -175,8 +175,8 @@ Once configured, publish with:
 
 Publication runs `check` first.
 
-GitHub Actions builds and publishes the API on every push to `main`, using `version` from `gradle.properties`. The workflow builds with Java 25, then fetches `MAVEN_USERNAME` and `MAVEN_PASSWORD` from `/Maven` in the Infisical `lords-of-minecraft` project, `prod` environment, using the same OIDC setup as OverlayV1. Make `INFISICAL_IDENTITY_ID` and `INFISICAL_DOMAIN` available as GitHub Actions secrets for this repository, and ensure the identity's OIDC policy allows this repository's `main` branch and access to `/Maven`.
+GitHub Actions builds and publishes the API on every push to `main`, using the version derived from the checked-out Git commit. The workflow builds with Java 25, then fetches `MAVEN_USERNAME` and `MAVEN_PASSWORD` from `/Maven` in the Infisical `lords-of-minecraft` project, `prod` environment, using the same OIDC setup as OverlayV1. Make `INFISICAL_IDENTITY_ID` and `INFISICAL_DOMAIN` available as GitHub Actions secrets for this repository, and ensure the identity's OIDC policy allows this repository's `main` branch and access to `/Maven`.
 
 MagicSpells is resolved as the compile-only dependency `io.github.team-sneakymouse:magicspells-core:4.0-Beta-18` from Maven Central, matching MagicSpells-Workspace's current published version. No local MagicSpells JAR is required.
 
-Released versions must not be overwritten. Keep `version` in `gradle.properties` and the server plugin version in `paper-plugin.yml` aligned when making a release.
+Versions use `yyyy.MM.dd-<12-character Git hash>`, with the date taken from the commit timestamp in UTC. Gradle derives this automatically for local builds and CI, and inserts the same version into `paper-plugin.yml`. Each new commit gets its own version; rebuilding the same commit reuses its version. Uncommitted edits keep the current HEAD version, so commit changes before publishing. Builds require a Git checkout.

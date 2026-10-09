@@ -1,3 +1,7 @@
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+
 plugins {
 	kotlin("jvm") version "2.3.21"
 	kotlin("plugin.serialization") version "2.3.21"
@@ -6,6 +10,16 @@ plugins {
 }
 
 group = "io.github.team-sneakymouse"
+
+version = providers.exec {
+	workingDir(rootDir)
+	commandLine("git", "show", "-s", "--format=%ct:%h", "--abbrev=12", "HEAD")
+}.standardOutput.asText.map { commit ->
+	val (timestamp, hash) = commit.trim().split(":", limit = 2)
+	val date = DateTimeFormatter.ofPattern("yyyy.MM.dd").withZone(ZoneOffset.UTC)
+		.format(Instant.ofEpochSecond(timestamp.toLong()))
+	"$date-$hash"
+}.get()
 
 repositories {
 	mavenCentral()
@@ -32,6 +46,13 @@ dependencies {
 }
 
 tasks.test { useJUnitPlatform() }
+
+tasks.processResources {
+	inputs.property("version", project.version.toString())
+	filesMatching("paper-plugin.yml") {
+		expand("version" to project.version.toString())
+	}
+}
 
 configure<JavaPluginExtension> {
 	toolchain.languageVersion.set(JavaLanguageVersion.of(25))

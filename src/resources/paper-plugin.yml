@@ -1,5 +1,5 @@
 name: SneakyPocketbase
-version: "1.0"
+version: "${version}"
 main: com.danidipp.sneakypocketbase.SneakyPocketbase
 api-version: "26.2"
 authors:
