@@ -37,7 +37,7 @@ dependencies {
 	implementation(kotlin("stdlib"))
 	compileOnly("io.papermc.paper:paper-api:26.2.build.117-stable")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
-	compileOnly("io.github.team-sneakymouse:magicspells-core:2026.10.09-17f579714ffe") {
+	compileOnly("io.github.team-sneakymouse:magicspells:2026.10.15-f0a44ae377a3") {
 		isTransitive = false
 	}
 	testImplementation(kotlin("test-junit5"))
