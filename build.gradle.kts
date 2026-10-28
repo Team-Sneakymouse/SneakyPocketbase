@@ -1,3 +1,4 @@
+import java.util.zip.ZipFile
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -82,6 +83,7 @@ val apiJar by tasks.registering(Jar::class) {
 	dependsOn(tasks.classes)
 	archiveClassifier.set("api")
 	from(sourceSets.main.get().output) {
+		include("com/danidipp/sneakypocketbase/PocketbaseWriteFailure*.class")
 		include("com/danidipp/sneakypocketbase/PocketbaseApi.class")
 		include("com/danidipp/sneakypocketbase/PocketbaseProvider.class")
 		include("com/danidipp/sneakypocketbase/AsyncPocketbaseEvent.class")
@@ -151,6 +153,8 @@ val verifyConsumerApi by tasks.registering {
 	dependsOn(apiJar)
 	doLast {
 		val apiClasses = listOf(
+			"com.danidipp.sneakypocketbase.PocketbaseWriteFailure",
+			"com.danidipp.sneakypocketbase.PocketbaseWriteFailure${'$'}Outcome",
 			"com.danidipp.sneakypocketbase.PocketbaseApi",
 			"com.danidipp.sneakypocketbase.PocketbaseProvider",
 			"com.danidipp.sneakypocketbase.AsyncPocketbaseEvent",
@@ -162,6 +166,11 @@ val verifyConsumerApi by tasks.registering {
 			"com.danidipp.sneakypocketbase.PocketbaseLifecycleSnapshot${'$'}CollectionStatus",
 			"com.danidipp.sneakypocketbase.AsyncPocketbaseLifecycleEvent",
 		)
+		ZipFile(apiJar.get().archiveFile.get().asFile).use { archive ->
+			apiClasses.forEach { name ->
+				check(archive.getEntry(name.replace('.', '/') + ".class") != null) { "Consumer API missing $name" }
+			}
+		}
 		val result = providers.exec {
 			commandLine(
 				javaToolchains.launcherFor(java.toolchain).get().metadata.installationPath

@@ -95,6 +95,18 @@ Subscription-ready means events can flow again. It does not mean the consumer's 
 
 `whenReady()` keeps its authentication callback semantics. Each registration runs asynchronously after the current handler first authenticates successfully, including after startup retries. It is not a recurring recovery notification, does not promise active subscriptions, and can run while realtime is disconnected. Use lifecycle events and snapshots for recovery. Pending callbacks attached to a replaced handler are cancelled; register against the current API again if that callback is still needed.
 
+## Create failure outcomes
+
+`PocketbaseApi.create` retains its existing signature and makes no automatic retry. Failed manager futures expose the Java/JDK-only `PocketbaseWriteFailure extends IOException`; unwrap `CompletionException`/`ExecutionException` and use `getOutcome()` and nullable `getStatusCode()`, not implementation exception classes or message matching.
+
+- `NOT_SENT`: local client availability/admission failed before launching the operation. No HTTP create was attempted.
+- `REJECTED`: the create received HTTP **400, 401 or 403** with a standard PocketBase JSON error envelope (matching `status` or legacy `code`, string `message`, object `data`). These are standard validation/authentication/authorization rejections known not to apply the create. No other HTTP code is classified rejected. Custom hooks/proxies must preserve standard rejection semantics; an envelope is not proof against a malicious or nonconforming server.
+- `UNKNOWN`: all other HTTP failures (including 404 and malformed/proxy rejection bodies), generic I/O/connect errors, timeout, cancellation and generation invalidation after admission. The CIO transport configuration is left unchanged; connection-refused exceptions are deliberately **not** promoted to `NOT_SENT` because an exception type alone does not establish that no earlier attempt ran.
+
+Only the first two outcomes establish non-application; retry eligibility is still the consumer's policy. An unknown write requires reconciliation, never blind resend. **A later exact-ID lookup returning 404 is not permission to create again** (a created record may already have been consumed/deleted). Cancelling the observer `CompletableFuture` does not stop its coroutine and produces the JDK cancellation signal, not `NOT_SENT`. Consumers must classify bare cancellation or unrecognized failures as uncertain.
+
+Failure messages are fixed and sanitized; raw bodies, payloads and credentials are not copied. Causes remain available for internal diagnostics and may be sensitive: never log them automatically. Existing get/update/delete/subscription contracts and lifecycle availability handling are unchanged. The new exception and nested enum are included in the skinny API publication; deploy a matching runtime plugin before consumers rely on these outcomes.
+
 ## Recovery behavior
 
 Authentication establishes initial API availability. Transport errors, request timeouts, and HTTP 5xx responses mark the API unavailable. HTTP 401 triggers reauthentication. Validation errors and collection permission errors stay request-specific. API calls have a 30-second timeout per request, including each page of a list fetch. Responses and lifecycle reasons never expose server error bodies or credentials.

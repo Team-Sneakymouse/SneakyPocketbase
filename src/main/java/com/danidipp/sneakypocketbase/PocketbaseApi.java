@@ -20,6 +20,15 @@ public interface PocketbaseApi {
         String filter
     );
 
+    /**
+     * Creates once, without automatic retries. Manager failures complete exceptionally with a
+     * {@link PocketbaseWriteFailure}; unwrap JDK CompletionException/ExecutionException to inspect it.
+     * Only NOT_SENT and authoritative standard PocketBase REJECTED outcomes prove non-application.
+     * UNKNOWN requires reconciliation; a subsequent lookup returning 404 does not authorize resend.
+     * Cancelling the returned observer future does not stop an admitted coroutine/HTTP request and
+     * yields a plain CancellationException, never evidence that the write was not sent.
+     * Causes are diagnostic only: do not log them automatically (they may contain sensitive data).
+     */
     CompletableFuture<String> create(String collection, String recordJson);
 
     CompletableFuture<String> update(String collection, String recordId, String recordJson);

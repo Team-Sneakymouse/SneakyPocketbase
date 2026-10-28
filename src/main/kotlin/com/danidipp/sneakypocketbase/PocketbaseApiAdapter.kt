@@ -63,12 +63,25 @@ internal class PocketbaseApiAdapter(
         records
     }
 
-    override fun create(collection: String, recordJson: String): CompletableFuture<String> = async { currentClient ->
+    override fun create(collection: String, recordJson: String): CompletableFuture<String> = async(create = true) { currentClient ->
         withTimeout(30_000) {
             currentClient.httpClient.post(collectionPath(collection)) {
                 contentType(ContentType.Application.Json)
                 setBody(recordJson)
-            }.successBody()
+            }.let { response ->
+                val code = response.status.value
+                if (code in listOf(400, 401, 403)) {
+                    val body = response.bodyAsText()
+                    val standardRejection = runCatching {
+                        val error = Json.parseToJsonElement(body).jsonObject
+                        (error["status"] ?: error["code"])?.jsonPrimitive?.content?.toIntOrNull() == code &&
+                            error["message"]?.jsonPrimitive?.isString == true && error["data"] is kotlinx.serialization.json.JsonObject
+                    }.getOrDefault(false)
+                    if (standardRejection) throw PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.REJECTED, code, PocketbaseHttpFailure(code))
+                }
+                if (code !in 200..299) throw PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.UNKNOWN, code, PocketbaseHttpFailure(code))
+                response.successBody()
+            }
         }
     }
 
@@ -92,11 +105,11 @@ internal class PocketbaseApiAdapter(
     override fun unsubscribe(collection: String): CompletableFuture<Void> =
         asyncVoid { unsubscribeAction(collection) }
 
-    private fun <T> async(operation: suspend (PocketbaseClient) -> T): CompletableFuture<T> {
+    private fun <T> async(create: Boolean = false, operation: suspend (PocketbaseClient) -> T): CompletableFuture<T> {
         val future = CompletableFuture<T>()
         val generation = lifecycle().generation
         val currentClient = try { client() } catch (failure: Throwable) {
-            future.completeExceptionally(failure)
+            future.completeExceptionally(if (create) PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.NOT_SENT, null, failure) else failure)
             return future
         }
         val job = try {
@@ -109,16 +122,18 @@ internal class PocketbaseApiAdapter(
                 }
                     .onSuccess(future::complete)
                     .onFailure { failure ->
-                        operationFailed(generation, failure)
-                        future.completeExceptionally(failure)
+                        operationFailed(generation, if (failure is PocketbaseWriteFailure) failure.cause ?: failure else failure)
+                        future.completeExceptionally(if (create && failure !is PocketbaseWriteFailure) PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.UNKNOWN, null, failure) else failure)
                     }
             }
         } catch (failure: Throwable) {
-            future.completeExceptionally(failure)
+            future.completeExceptionally(if (create) PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.NOT_SENT, null, failure) else failure)
             return future
         }
         job.invokeOnCompletion { failure ->
-            if (failure != null && !future.isDone) future.completeExceptionally(failure)
+            if (failure != null && !future.isDone) future.completeExceptionally(
+                if (create) PocketbaseWriteFailure(PocketbaseWriteFailure.Outcome.UNKNOWN, null, failure) else failure
+            )
         }
         return future
     }
