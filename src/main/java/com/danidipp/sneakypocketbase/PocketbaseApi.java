@@ -3,7 +3,7 @@ package com.danidipp.sneakypocketbase;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
-/** Java-compatible interface exposed to other plugin classloaders. */
+/** Java-compatible interface exposed to other plugin classloaders. JDK types only (no Kotlin or coroutines) so consumers need neither. */
 public interface PocketbaseApi {
     /** Authentication callback only; does not promise realtime or collection readiness. Runs asynchronously. */
     void whenReady(Runnable callback);

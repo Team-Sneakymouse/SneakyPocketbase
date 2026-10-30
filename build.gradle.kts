@@ -79,6 +79,7 @@ tasks.build {
 	dependsOn(tasks.shadowJar, "apiJar")
 }
 
+// Published API artifact: renaming or reshaping it can break SneakyPersonalization and SneakyMail builds; change them together.
 val apiJar by tasks.registering(Jar::class) {
 	dependsOn(tasks.classes)
 	archiveClassifier.set("api")
