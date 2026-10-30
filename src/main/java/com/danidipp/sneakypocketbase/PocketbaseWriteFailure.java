@@ -3,7 +3,7 @@ package com.danidipp.sneakypocketbase;
 import java.io.IOException;
 import java.util.Objects;
 
-/** A conservative create outcome. The cause is diagnostic only and may contain sensitive data. */
+/** A conservative create outcome; never retry a create whose outcome is unknown without an idempotency key. The cause is diagnostic only and may contain sensitive data. */
 public final class PocketbaseWriteFailure extends IOException {
     /** Whether the manager can prove that a create did not apply. */
     public enum Outcome {
