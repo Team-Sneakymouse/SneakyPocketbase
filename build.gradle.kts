@@ -31,16 +31,13 @@ repositories {
 		name = "papermc"
 		url = uri("https://repo.papermc.io/repository/maven-public/")
 	}
-	maven("https://maven.sneakyrp.com/releases")
+	maven("https://maven.sneakyrp.com/sneakymouse")
 }
 
 dependencies {
 	implementation(kotlin("stdlib"))
 	compileOnly("io.papermc.paper:paper-api:26.2.build.117-stable")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
-	compileOnly("io.github.team-sneakymouse:magicspells:2026.10.15-f0a44ae377a3") {
-		isTransitive = false
-	}
 	testImplementation(kotlin("test-junit5"))
 	testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
 	testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.1")
@@ -137,7 +134,7 @@ publishing {
 	repositories {
 		maven {
 			name = "sneakyrp"
-			url = uri("https://maven.sneakyrp.com/releases")
+			url = uri("https://maven.sneakyrp.com/sneakymouse")
 			credentials(PasswordCredentials::class)
 			authentication {
 				create<org.gradle.authentication.http.BasicAuthentication>("basic")
