@@ -31,7 +31,7 @@ repositories {
 		name = "papermc"
 		url = uri("https://repo.papermc.io/repository/maven-public/")
 	}
-	maven("https://maven.sneakyrp.com/releases")
+	maven("https://maven.sneakyrp.com/sneakymouse")
 }
 
 dependencies {
@@ -134,7 +134,7 @@ publishing {
 	repositories {
 		maven {
 			name = "sneakyrp"
-			url = uri("https://maven.sneakyrp.com/releases")
+			url = uri("https://maven.sneakyrp.com/sneakymouse")
 			credentials(PasswordCredentials::class)
 			authentication {
 				create<org.gradle.authentication.http.BasicAuthentication>("basic")
