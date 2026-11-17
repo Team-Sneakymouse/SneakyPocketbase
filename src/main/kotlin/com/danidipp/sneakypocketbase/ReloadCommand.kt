@@ -13,13 +13,11 @@ class ReloadCommand: Command("reload") {
         val plugin = SneakyPocketbase.getInstance()
         plugin.reloadConfig()
         val restarted = plugin.restartPocketbase()
-        plugin.loadConfig()
         if (!restarted) {
             sender.sendMessage("Reloaded config, but Pocketbase restart failed. Check server logs.")
             return true
         }
-        val variableStatus = MSVariableSync.statusSnapshot()
-        sender.sendMessage("Reloaded config. MagicSpells variable sync: ${variableStatus.configuredCount} configured, ${variableStatus.activeCount} active, ${variableStatus.unsupportedCount} unsupported.")
+        sender.sendMessage("Reloaded config.")
         return true
     }
 }

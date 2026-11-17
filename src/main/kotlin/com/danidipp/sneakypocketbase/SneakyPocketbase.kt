@@ -101,7 +101,6 @@ class SneakyPocketbase : JavaPlugin() {
             logger.warning("Plugin is disabled. Skipping onEnable.")
             return
         }
-        loadConfig()
         lifecycle.startDelivery()
         Bukkit.getServer().commandMap.registerAll(IDENTIFIER, listOf(
             ReloadCommand(),
@@ -109,26 +108,6 @@ class SneakyPocketbase : JavaPlugin() {
         ))
         pbHandler.runRealtime()
     }
-    fun loadConfig() {
-        if (Bukkit.getPluginManager().isPluginEnabled("MagicSpells")) {
-            val configVariableSection = config.getConfigurationSection("variables")
-            val configVariables = configVariableSection?.getKeys(false) ?: emptySet()
-            val configuredVariables = if (configVariableSection == null || configVariables.isEmpty()) {
-                emptyMap()
-            } else {
-                configVariables.associateWith { configVariableSection.getString(it) }
-            }
-
-            val parseResult = MSVariableSync.parsePolicy(configuredVariables)
-            for ((variable, error) in parseResult.errors) {
-                logger.warning("Ignoring MagicSpells variable sync config for $variable: $error")
-            }
-            MSVariableSync.applyPolicy(parseResult.policy)
-        } else {
-            MSVariableSync.applyPolicy(MSVariableSync.VariableSyncPolicy.EMPTY)
-        }
-    }
-
     fun restartPocketbase(): Boolean {
         val settings = readPocketbaseSettings() ?: return false
         val owner = lifecycle.beginHandler()
@@ -183,7 +162,6 @@ class SneakyPocketbase : JavaPlugin() {
         lifecycle.stop()
         stopPocketbaseLoadedCallbacks()
         logger.info("Disabling SneakyPocketbase")
-        MSVariableSync.stopSync()
 
         if (::pbHandler.isInitialized) {
             logger.info("Shutting down Pocketbase")

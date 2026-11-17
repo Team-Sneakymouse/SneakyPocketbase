@@ -3,6 +3,3 @@ pocketbase:
   host: ""
   user: ""
   password: ""
-#variables:
-#  - ScryingGlobalCount
-#  - TormentNexusCount

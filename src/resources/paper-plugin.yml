@@ -5,8 +5,3 @@ api-version: "26.2"
 authors:
   - DaniDipp
 description: "Paper Plugin for interacting with Pocketbase"
-dependencies:
-    server:
-        MagicSpells:
-            load: BEFORE
-            required: false

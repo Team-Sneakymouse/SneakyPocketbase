@@ -38,9 +38,6 @@ dependencies {
 	implementation(kotlin("stdlib"))
 	compileOnly("io.papermc.paper:paper-api:26.2.build.117-stable")
 	implementation("io.github.agrevster:pocketbase-kotlin:2.7.1")
-	compileOnly("io.github.team-sneakymouse:magicspells:2026.10.15-f0a44ae377a3") {
-		isTransitive = false
-	}
 	testImplementation(kotlin("test-junit5"))
 	testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
 	testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.1")
